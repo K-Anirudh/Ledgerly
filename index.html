@@ -289,11 +289,12 @@ const BANKS = [
   { id:"indian",  abbr:"INDB",  name:"Indian Bank",          color:"#1A4B8C", parser:parseIndianBank },
   { id:"gcub",    abbr:"GCUB",  name:"Gayatri Co-op Urban",   color:"#2E7D32", parser:parseGayatri },
   { id:"canara",  abbr:"CNRB",  name:"Canara Bank",          color:"#00529B", parser:parseCanara },
-  { id:"sbi",     abbr:"SBI",   name:"State Bank of India",  color:"#1B3A8B", parser:null },
-  { id:"hdfc",    abbr:"HDFC",  name:"HDFC Bank",            color:"#13357B", parser:null },
-  { id:"axis",    abbr:"AXIS",  name:"Axis Bank",            color:"#97144D", parser:null },
+  { id:"ubi",     abbr:"UBI",   name:"Union Bank of India",  color:"#E2231A", parser:parseUnionBank },
+  { id:"axis",    abbr:"AXIS",  name:"Axis Bank",            color:"#97144D", parser:parseAxis },
+  { id:"sbi",     abbr:"SBI",   name:"State Bank of India",  color:"#1B3A8B", parser:parseSBI },
+  { id:"hdfc",    abbr:"HDFC",  name:"HDFC Bank",            color:"#13357B", parser:parseHDFC },
   { id:"kotak",   abbr:"KOTAK", name:"Kotak Mahindra",       color:"#B5121B", parser:null },
-  { id:"bob",     abbr:"BOB",   name:"Bank of Baroda",       color:"#E35205", parser:null },
+  { id:"bob",     abbr:"BOB",   name:"Bank of Baroda",       color:"#E35205", parser:parseBoB },
   { id:"pnb",     abbr:"PNB",   name:"Punjab National",      color:"#A5235A", parser:null },
 ];
 const REGISTRY = Object.fromEntries(BANKS.map(b => [b.id, b]));
@@ -794,6 +795,825 @@ function canara_account(items){
     phone:      grab(/(?:^|\n)Phone\t+([0-9]+)/i),
     period: (from && to) ? `${from} – ${to}` : (from || to || "")
   };
+}
+
+/* ============================================================
+   UNION BANK OF INDIA PARSER
+   Serial-numbered like ICICI, but Amount and Balance each share
+   ONE column with a (Cr)/(Dr) suffix — so the parser splits the
+   single Amount into Debit/Credit by suffix. Balance is signed
+   by suffix too (almost always Cr). Description wraps on lines
+   below the anchor; those continuation lines have text in the
+   txnId / remarks columns and no amount.
+   ============================================================ */
+function ubi_col(xc){
+  if (xc < 85)  return "sno";
+  if (xc < 140) return "date";
+  if (xc < 195) return "txnId";
+  if (xc < 400) return "remarks";
+  if (xc < 485) return "amount";   // number + (Cr)/(Dr) suffix
+  return "balance";                // number + (Cr)/(Dr) suffix
+}
+const UBI_DATE = /^\d{2}\/\d{2}\/\d{4}$/;
+
+async function parseUnionBank(arrayBuffer, onProgress){
+  const pdf = await pdfjsLib.getDocument({ data: arrayBuffer }).promise;
+  const txns = [];
+  let account = null, cur = null;
+
+  for (let p = 1; p <= pdf.numPages; p++){
+    const page = await pdf.getPage(p);
+    const H = page.getViewport({ scale: 1 }).height;
+    const tc = await page.getTextContent();
+    const items = [];
+    for (const it of tc.items){
+      const s = (it.str || "").trim();
+      if (!s) continue;
+      const x = it.transform[4], w = it.width || 0, top = H - it.transform[5];
+      items.push({ t:s, x0:x, x1:x+w, xc:x + w/2, top });
+    }
+    if (p === 1) account = ubi_account(items);
+
+    const lines = clusterLines(items);
+    for (const line of lines){
+      const b = {};
+      for (const c of line.cells.slice().sort((p,q)=>p.xc-q.xc)) (b[ubi_col(c.xc)] = b[ubi_col(c.xc)] || []).push(c.t);
+      const sno = (b.sno || []).join(""), date = (b.date || []).join("");
+      if (/^\d+$/.test(sno) && UBI_DATE.test(date)){
+        if (cur) txns.push(cur);
+        cur = {
+          sno: parseInt(sno, 10),
+          date,
+          txnId: (b.txnId || []).join(""),
+          remarks: (b.remarks || []).slice(),
+          amount: (b.amount || []).slice(),
+          balance: (b.balance || []).slice()
+        };
+      } else if (cur){
+        // continuation line — append wrapped description text;
+        // anything that lands in the txnId column on a non-anchor line
+        // is part of the description (e.g. trailing txn refs).
+        if (b.remarks) cur.remarks = cur.remarks.concat(b.remarks);
+        if (b.txnId)   cur.remarks = cur.remarks.concat(b.txnId);
+      }
+    }
+    if (onProgress) onProgress(p, pdf.numPages);
+  }
+  if (cur) txns.push(cur);
+
+  const UBI_PAIR = /([\d,]+\.\d{2})\s*\((Cr|Dr)\)/i;
+  const rows = txns.map(t => {
+    const am = UBI_PAIR.exec(t.amount.join(""));
+    const amt = am ? toNum(am[1]) : null;
+    const isDebit = am && /Dr/i.test(am[2]);
+    const bm = UBI_PAIR.exec(t.balance.join(""));
+    let bal = bm ? toNum(bm[1]) : null;
+    if (bal !== null && bm && /Dr/i.test(bm[2])) bal = -bal;
+    return {
+      sno: t.sno,
+      date: t.date,
+      txnId: t.txnId,
+      remarks: t.remarks.join(" ").replace(/\s+/g," ").trim(),
+      debit:  (amt !== null &&  isDebit) ? amt : null,
+      credit: (amt !== null && !isDebit) ? amt : null,
+      balance: bal
+    };
+  });
+
+  const A = account || {};
+  return {
+    period: A.period || "",
+    account: [
+      { label:"Account Name", value:A.name||"" },     { label:"Account Number", value:A.number||"" },
+      { label:"Account Type", value:A.type||"" },     { label:"Customer/CIF ID", value:A.custId||"" },
+      { label:"IFSC Code", value:A.ifsc||"" },        { label:"Home Branch", value:A.branch||"" },
+      { label:"Currency", value:A.currency||"" },     { label:"Statement Period", value:A.period||"" },
+      { label:"Total Transactions", value:String(rows.length) }
+    ],
+    columns: [
+      { key:"sno", label:"S.No", type:"center", width:7 },
+      { key:"date", label:"Date", type:"center", width:13 },
+      { key:"txnId", label:"Transaction ID", type:"mono", width:15 },
+      { key:"remarks", label:"Remarks", type:"text", width:54 },
+      { key:"debit", label:"Debit", type:"dr", width:16 },
+      { key:"credit", label:"Credit", type:"cr", width:16 },
+      { key:"balance", label:"Balance", type:"bal", width:18 }
+    ],
+    rows
+  };
+}
+function ubi_account(items){
+  const top = items.filter(i => i.top < 370);
+  const lines = clusterLines(top);
+  const text = lines.map(line => {
+    const cs = line.cells.slice().sort((a,b)=>a.x0-b.x0);
+    let out = [], cell = "", prevX1 = null;
+    for (const c of cs){
+      if (prevX1 !== null && (c.x0 - prevX1) > 8){ out.push(cell); cell = c.t; }
+      else cell = cell ? cell + " " + c.t : c.t;
+      prevX1 = c.x1;
+    }
+    if (cell) out.push(cell);
+    return out.join("\t");
+  }).join("\n");
+  const grab = re => { const m = text.match(re); return m ? m[1].trim() : ""; };
+
+  // Name: may continue onto the next line (e.g. "FERTILIZERS")
+  let name = grab(/(?:^|\n)Name\t+([^\t\n]+)/i);
+  const arr = text.split("\n");
+  const ni = arr.findIndex(l => /^Name\t/i.test(l));
+  if (ni > -1 && arr[ni+1]){
+    const fc = arr[ni+1].split("\t")[0].trim();
+    if (/^[A-Z][A-Z .&-]+$/.test(fc) && !/:/.test(fc) && fc.length < 60 &&
+        !/^(Address|City|State|Pincode|Mobile|Email|Home|IFSC|Account|Customer|Currency|Branch|Statement)/i.test(fc))
+      name = (name + " " + fc).trim();
+  }
+
+  // Statement Period — the closing year often wraps to the next line:
+  //   "Statement Period\t01/04/2024\tTo\t31/03"
+  //   "\t/2025"
+  let period = "";
+  const p1 = text.match(/Statement\s*Period\t+(\d{2}\/\d{2}\/\d{4})\s+To\s+(\d{2}\/\d{2}\/\d{4})/i);
+  if (p1){
+    period = p1[1] + " – " + p1[2];
+  } else {
+    const p2 = text.match(/Statement\s*Period\t+(\d{2}\/\d{2}\/\d{4})\s+To\s+(\d{2}\/\d{2})\s*\n\s*\/?(\d{4})/i);
+    if (p2) period = p2[1] + " – " + p2[2] + "/" + p2[3];
+  }
+
+  return {
+    name,
+    number:   grab(/Account\s*Number\t+(\d+)/i),
+    type:     grab(/Account\s*Type\t+([^\t\n]+)/i),
+    custId:   grab(/Customer\/CIF\s*ID\t+([^\t\n]+)/i),
+    ifsc:     grab(/(?:^|\n)IFSC\t+([A-Z0-9]+)/i),
+    branch:   grab(/Home\s*branch\t+([^\t\n]+)/i),
+    currency: grab(/Currency\t+([A-Za-z]+)/i),
+    period
+  };
+}
+
+/* ============================================================
+   AXIS BANK PARSER
+   No serial; description wraps on lines ABOVE the dated line
+   (and the dated line is the anchor). Separate Debit & Credit
+   columns. Balance is a plain positive number. Each transaction
+   is isolated by a vertical gap; the anchor is any line carrying
+   BOTH a DD-MM-YYYY date and a balance — no keyword list needed.
+   "Init.Br" column on the far right is a branch code.
+   ============================================================ */
+function axis_col(xc){
+  if (xc < 85)  return "date";
+  if (xc < 130) return "chq";
+  if (xc < 340) return "part";
+  if (xc < 390) return "debit";
+  if (xc < 460) return "credit";
+  if (xc < 530) return "balance";
+  return "br";
+}
+const AXIS_DATE = /^\d{2}-\d{2}-\d{4}$/;
+const AXIS_AMT  = /^[\d,]+\.\d{2}$/;
+const AXIS_GAP  = 11;
+
+async function parseAxis(arrayBuffer, onProgress){
+  const pdf = await pdfjsLib.getDocument({ data: arrayBuffer }).promise;
+  const txns = [];
+  let account = null;
+
+  for (let p = 1; p <= pdf.numPages; p++){
+    const page = await pdf.getPage(p);
+    const H = page.getViewport({ scale: 1 }).height;
+    const tc = await page.getTextContent();
+    const items = [];
+    for (const it of tc.items){
+      const s = (it.str || "").trim();
+      if (!s) continue;
+      const x = it.transform[4], w = it.width || 0, top = H - it.transform[5];
+      items.push({ t:s, x0:x, x1:x+w, xc:x + w/2, top });
+    }
+    if (p === 1) account = axis_account(items);
+
+    const lines = clusterLines(items);
+    // group lines into blocks by vertical gap
+    const blocks = [];
+    for (const ln of lines){
+      const last = blocks[blocks.length-1];
+      if (last && (ln.top - last.btm) <= AXIS_GAP){ last.lines.push(ln); last.btm = ln.top; }
+      else blocks.push({ lines:[ln], btm: ln.top });
+    }
+    for (const blk of blocks){
+      let anchor = null;
+      const parts = [];
+      for (const ln of blk.lines){
+        const b = {};
+        for (const c of ln.cells.slice().sort((p,q)=>p.xc-q.xc)) (b[axis_col(c.xc)] = b[axis_col(c.xc)] || []).push(c.t);
+        const date = (b.date || []).join(""), bal = (b.balance || []).join("");
+        if (AXIS_DATE.test(date) && AXIS_AMT.test(bal)) anchor = b;
+        if (b.part) parts.push.apply(parts, b.part);
+      }
+      if (!anchor) continue;                       // header / opening-bal / total / closing / legend lines
+      txns.push({
+        date: (anchor.date || []).join(""),
+        chq:  (anchor.chq  || []).join(""),
+        particulars: parts.join(" ").replace(/\s+/g," ").trim(),
+        debit:  toNum((anchor.debit  || []).join("")),
+        credit: toNum((anchor.credit || []).join("")),
+        balance: toNum((anchor.balance || []).join("")),
+        br: (anchor.br || []).join("")
+      });
+    }
+    if (onProgress) onProgress(p, pdf.numPages);
+  }
+
+  const A = account || {};
+  return {
+    period: A.period || "",
+    account: [
+      { label:"Account Name", value:A.name||"" },     { label:"Account Number", value:A.number||"" },
+      { label:"Customer ID", value:A.custId||"" },    { label:"IFSC Code", value:A.ifsc||"" },
+      { label:"MICR Code", value:A.micr||"" },        { label:"Scheme", value:A.scheme||"" },
+      { label:"Currency", value:A.currency||"" },     { label:"Statement Period", value:A.period||"" },
+      { label:"Total Transactions", value:String(txns.length) }
+    ],
+    columns: [
+      { key:"date", label:"Tran Date", type:"center", width:13 },
+      { key:"chq", label:"Chq No", type:"center", width:11 },
+      { key:"particulars", label:"Particulars", type:"text", width:54 },
+      { key:"debit", label:"Debit", type:"dr", width:16 },
+      { key:"credit", label:"Credit", type:"cr", width:16 },
+      { key:"balance", label:"Balance", type:"bal", width:18 },
+      { key:"br", label:"Init. Br", type:"center", width:9 }
+    ],
+    rows: txns
+  };
+}
+function axis_account(items){
+  const top = items.filter(i => i.top < 230);
+  const lines = clusterLines(top);
+  const text = lines.map(line => {
+    const cs = line.cells.slice().sort((a,b)=>a.x0-b.x0);
+    let out = [], cell = "", prevX1 = null;
+    for (const c of cs){
+      if (prevX1 !== null && (c.x0 - prevX1) > 8){ out.push(cell); cell = c.t; }
+      else cell = cell ? cell + " " + c.t : c.t;
+      prevX1 = c.x1;
+    }
+    if (cell) out.push(cell);
+    return out.join("\t");
+  }).join("\n");
+  const grab = re => { const m = text.match(re); return m ? m[1].trim() : ""; };
+  // Holder name = first non-empty cell of the first clustered line
+  const arr = text.split("\n");
+  const name = (arr[0] || "").split("\t")[0].trim();
+  const from = grab(/From\s*:\s*([0-9]{2}-[0-9]{2}-[0-9]{4})/i);
+  const to   = grab(/\bTo\s*:\s*([0-9]{2}-[0-9]{2}-[0-9]{4})/i);
+  return {
+    name,
+    number:   grab(/Account\s*No\s*:\s*([0-9]+)/i),
+    custId:   grab(/Customer\s*ID\s*:\s*([0-9]+)/i),
+    ifsc:     grab(/IFSC\s*Code\s*:\s*([A-Z0-9]+)/i),
+    micr:     grab(/MICR\s*Code\s*:\s*([0-9]+)/i),
+    scheme:   grab(/Scheme\s*:\s*([^\t\n|]+?)(?=\s*(?:CKYC|$))/i),
+    currency: grab(/Currency\s*:\s*([A-Za-z]+)/i),
+    period: (from && to) ? `${from} – ${to}` : (from || to || "")
+  };
+}
+
+/* ============================================================
+   STATE BANK OF INDIA (SBI) PARSER
+   Tabular layout; no serial. Each transaction is a multi-line
+   row where the anchor sits at the TOP of the block (the dates
+   line carries debit/credit + balance directly), and BOTH the
+   Description column AND the Ref No./Cheque No. column wrap
+   their text below the anchor. Supports CC (Cash Credit) accounts
+   where balances are NEGATIVE (overdraft). Indian comma format.
+   Anchor = line with both DD/MM/YYYY date and a (possibly signed)
+   balance amount — no keyword list needed. Repeating per-page
+   "Txn Date Value Date ..." header rows fail the anchor test.
+   ============================================================ */
+function sbi_col(xc){
+  if (xc < 90)  return "date";
+  if (xc < 140) return "vdate";
+  if (xc < 220) return "desc";
+  if (xc < 300) return "ref";
+  if (xc < 370) return "br";
+  if (xc < 430) return "debit";
+  if (xc < 490) return "credit";
+  return "balance";
+}
+const SBI_DATE = /^\d{2}\/\d{2}\/\d{4}$/;
+const SBI_AMT  = /^-?[\d,]+\.\d{2}$/;   // balances can be negative on CC accounts
+const SBI_GAP  = 11;
+
+async function parseSBI(arrayBuffer, onProgress){
+  const pdf = await pdfjsLib.getDocument({ data: arrayBuffer }).promise;
+  const txns = [];
+  let account = null;
+
+  for (let p = 1; p <= pdf.numPages; p++){
+    const page = await pdf.getPage(p);
+    const H = page.getViewport({ scale: 1 }).height;
+    const tc = await page.getTextContent();
+    const items = [];
+    for (const it of tc.items){
+      const s = (it.str || "").trim();
+      if (!s) continue;
+      const x = it.transform[4], w = it.width || 0, top = H - it.transform[5];
+      items.push({ t:s, x0:x, x1:x+w, xc:x + w/2, top });
+    }
+    if (p === 1) account = sbi_account(items);
+
+    const lines = clusterLines(items);
+    // group lines into blocks by vertical gap (intra-block ≈8pt, inter-block ≈12pt)
+    const blocks = [];
+    for (const ln of lines){
+      const last = blocks[blocks.length-1];
+      if (last && (ln.top - last.btm) <= SBI_GAP){ last.lines.push(ln); last.btm = ln.top; }
+      else blocks.push({ lines:[ln], btm: ln.top });
+    }
+    for (const blk of blocks){
+      let anchor = null;
+      const descs = [], refs = [];
+      for (const ln of blk.lines){
+        const b = {};
+        for (const c of ln.cells.slice().sort((p,q)=>p.xc-q.xc)) (b[sbi_col(c.xc)] = b[sbi_col(c.xc)] || []).push(c.t);
+        const date = (b.date || []).join(""), bal = (b.balance || []).join("");
+        if (SBI_DATE.test(date) && SBI_AMT.test(bal)) anchor = b;
+        if (b.desc) descs.push.apply(descs, b.desc);
+        if (b.ref)  refs.push.apply(refs, b.ref);
+      }
+      if (!anchor) continue;                     // header / address / opening-balance rows fail naturally
+      txns.push({
+        date:  (anchor.date  || []).join(""),
+        vdate: (anchor.vdate || []).join(""),
+        desc:  descs.join(" ").replace(/\s+/g," ").trim(),
+        ref:   refs.join(" ").replace(/\s+/g," ").trim(),
+        br:    (anchor.br || []).join(""),
+        debit:   toNum((anchor.debit   || []).join("")),
+        credit:  toNum((anchor.credit  || []).join("")),
+        balance: toNum((anchor.balance || []).join(""))
+      });
+    }
+    if (onProgress) onProgress(p, pdf.numPages);
+  }
+
+  const A = account || {};
+  return {
+    period: A.period || "",
+    account: [
+      { label:"Account Name", value:A.name||"" },         { label:"Account Number", value:A.number||"" },
+      { label:"Account Description", value:A.descr||"" }, { label:"Branch", value:A.branch||"" },
+      { label:"CIF No.", value:A.cif||"" },               { label:"IFS Code", value:A.ifsc||"" },
+      { label:"MICR Code", value:A.micr||"" },            { label:"Drawing Power", value:A.drawingPower||"" },
+      { label:"Interest Rate", value:A.intRate||"" },     { label:"Opening Balance", value:A.opening||"" },
+      { label:"Statement Period", value:A.period||"" },   { label:"Total Transactions", value:String(txns.length) }
+    ],
+    columns: [
+      { key:"date", label:"Txn Date", type:"center", width:13 },
+      { key:"vdate", label:"Value Date", type:"center", width:13 },
+      { key:"desc", label:"Description", type:"text", width:32 },
+      { key:"ref", label:"Ref No. / Cheque No.", type:"text", width:32 },
+      { key:"br", label:"Branch Code", type:"center", width:11 },
+      { key:"debit", label:"Debit", type:"dr", width:15 },
+      { key:"credit", label:"Credit", type:"cr", width:15 },
+      { key:"balance", label:"Balance", type:"bal", width:18 }
+    ],
+    rows: txns
+  };
+}
+function sbi_account(items){
+  const top = items.filter(i => i.top < 400);
+  const lines = clusterLines(top);
+  const text = lines.map(line => {
+    const cs = line.cells.slice().sort((a,b)=>a.x0-b.x0);
+    let out = [], cell = "", prevX1 = null;
+    for (const c of cs){
+      if (prevX1 !== null && (c.x0 - prevX1) > 8){ out.push(cell); cell = c.t; }
+      else cell = cell ? cell + " " + c.t : c.t;
+      prevX1 = c.x1;
+    }
+    if (cell) out.push(cell);
+    return out.join("\t");
+  }).join("\n");
+  // value side may begin with ":" or ":<tab>" or "(cid:9)" — strip leading colons/whitespace
+  const grab = re => {
+    const m = text.match(re);
+    return m ? m[1].replace(/^[\s:]+/, "").replace(/^\(cid:\d+\)/, "").trim() : "";
+  };
+  return {
+    name:        grab(/Account\s*Name\s*\t+([^\t\n]+)/i),
+    number:      grab(/Account\s*Number\s*\t+([^\t\n]+)/i),
+    descr:       grab(/Account\s*Description\s*\t+([^\t\n]+)/i),
+    branch:      grab(/(?:^|\n)Branch\s*\t+([^\t\n]+)/i),
+    drawingPower:grab(/Drawing\s*Power\s*\t+([^\t\n]+)/i),
+    intRate:     grab(/Interest\s*Rate\s*\([^)]*\)\s*\t+([^\t\n]+)/i),
+    cif:         grab(/CIF\s*No\.?\s*\t+([^\t\n]+)/i),
+    ifsc:        grab(/IFS\s*Code\s*\t+([^\t\n]+)/i),
+    micr:        grab(/MICR\s*Code\s*\t+([^\t\n]+)/i),
+    opening:     grab(/Opening\s*Balance\s*as\s*on[^\t\n]*\t+([^\t\n]+)/i),
+    period:      (function(){
+      const m = text.match(/Account\s*Statement\s*from\s+([^\t\n]+?)\s+to\s+([^\t\n]+)/i);
+      return m ? `${m[1].trim()} – ${m[2].trim()}` : "";
+    })()
+  };
+}
+
+/* ============================================================
+   HDFC BANK PARSER
+   Layout: no serial; per-page header repeats above (bank info,
+   address, account block), so we filter by y-band (220 < top < 770).
+   The dated anchor line carries: Date | Cheque/Ref | Value Date |
+   Withdrawal | Deposit | Closing Balance. Narration wraps on lines
+   BELOW the anchor (wrap-below, like Canara). Separate Withdrawal /
+   Deposit columns (only one populated per row).
+   Balance can be NEGATIVE (this is a Current/OD account with a 1.55Cr
+   OD limit; ICICI's overdraft pattern). Date format is DD/MM/YY.
+   Anchor = line carrying BOTH a DD/MM/YY date AND a (possibly signed)
+   balance amount — no keyword/skip list needed. Per-page header rows,
+   the "STATEMENT SUMMARY" line, and the final totals row all fail
+   the (date + balance) test naturally.
+
+   CRITICAL: the date column boundary is xc < 65 (NOT a generous <90),
+   because narration starts at x0=68 and short narration words like
+   "UPI-PEDDI" can have xc≈88 — that would otherwise be misclassified
+   as part of the date and break the anchor regex.
+   ============================================================ */
+function hdfc_col(xc){
+  if (xc < 65)  return "date";
+  if (xc < 280) return "narr";
+  if (xc < 358) return "chq";
+  if (xc < 400) return "vdate";
+  if (xc < 490) return "debit";
+  if (xc < 565) return "credit";
+  return "balance";
+}
+const HDFC_DATE = /^\d{2}\/\d{2}\/\d{2}$/;
+const HDFC_AMT  = /^-?[\d,]+\.\d{2}$/;   // balance can be signed (OD/CC)
+
+async function parseHDFC(arrayBuffer, onProgress){
+  const pdf = await pdfjsLib.getDocument({ data: arrayBuffer }).promise;
+  const txns = [];
+  let account = null, cur = null;
+
+  for (let p = 1; p <= pdf.numPages; p++){
+    const page = await pdf.getPage(p);
+    const H = page.getViewport({ scale: 1 }).height;
+    const tc = await page.getTextContent();
+    const items = [];
+    for (const it of tc.items){
+      const s = (it.str || "").trim();
+      if (!s) continue;
+      const x = it.transform[4], w = it.width || 0, top = H - it.transform[5];
+      items.push({ t:s, x0:x, x1:x+w, xc:x + w/2, top });
+    }
+    if (p === 1) account = hdfc_account(items);
+
+    // Restrict to the transaction band: skip per-page header (top ≤ 220)
+    // and footer (top ≥ 770).
+    const body = items.filter(i => i.top > 220 && i.top < 770);
+
+    const lines = clusterLines(body);
+    for (const line of lines){
+      const b = {};
+      for (const c of line.cells.slice().sort((p,q)=>p.xc-q.xc)) (b[hdfc_col(c.xc)] = b[hdfc_col(c.xc)] || []).push(c.t);
+      const date = (b.date || []).join(""), bal = (b.balance || []).join("");
+      if (HDFC_DATE.test(date) && HDFC_AMT.test(bal)){
+        if (cur) txns.push(cur);
+        cur = {
+          date,
+          narration: (b.narr || []).slice(),
+          chq:   (b.chq   || []).join(""),
+          vdate: (b.vdate || []).join(""),
+          debit:   toNum((b.debit  || []).join("")),
+          credit:  toNum((b.credit || []).join("")),
+          balance: toNum(bal)   // already handles leading "-"
+        };
+      } else if (cur && b.narr){
+        cur.narration = cur.narration.concat(b.narr);   // wrapped narration
+      }
+    }
+    if (onProgress) onProgress(p, pdf.numPages);
+  }
+  if (cur) txns.push(cur);
+
+  const rows = txns.map(t => ({
+    date: t.date,
+    narration: t.narration.join(" ").replace(/\s+/g," ").trim(),
+    chq: t.chq,
+    vdate: t.vdate,
+    debit: t.debit, credit: t.credit, balance: t.balance
+  }));
+
+  const A = account || {};
+  return {
+    period: A.period || "",
+    account: [
+      { label:"Account Name", value:A.name||"" },     { label:"Account Number", value:A.number||"" },
+      { label:"Customer ID", value:A.custId||"" },    { label:"Account Type", value:A.type||"" },
+      { label:"Branch", value:A.branch||"" },         { label:"Branch Code", value:A.branchCode||"" },
+      { label:"IFSC Code", value:A.ifsc||"" },        { label:"MICR Code", value:A.micr||"" },
+      { label:"Currency", value:A.currency||"" },     { label:"OD Limit", value:A.odLimit||"" },
+      { label:"Statement Period", value:A.period||"" },{ label:"Total Transactions", value:String(rows.length) }
+    ],
+    columns: [
+      { key:"date", label:"Date", type:"center", width:11 },
+      { key:"narration", label:"Narration", type:"text", width:50 },
+      { key:"chq", label:"Chq./Ref. No.", type:"mono", width:18 },
+      { key:"vdate", label:"Value Date", type:"center", width:11 },
+      { key:"debit", label:"Withdrawal Amt.", type:"dr", width:17 },
+      { key:"credit", label:"Deposit Amt.", type:"cr", width:17 },
+      { key:"balance", label:"Closing Balance", type:"bal", width:18 }
+    ],
+    rows
+  };
+}
+function hdfc_account(items){
+  const top = items.filter(i => i.top < 220);
+  const lines = clusterLines(top);
+  // Build tabbed text — splits items into "cells" when there is a horizontal
+  // gap > 8pt. HDFC's column gap between label and ":" is ~4pt and ":" → value
+  // is ~3pt, so each label-value pair lands in ONE cell joined by spaces
+  // (e.g. "Account Branch : KARIMNAGAR - TELANGANA"). The left-side address
+  // block sits in its own cell because the gap to the right column is huge.
+  const text = lines.map(line => {
+    const cs = line.cells.slice().sort((a,b)=>a.x0-b.x0);
+    let out = [], cell = "", prevX1 = null;
+    for (const c of cs){
+      if (prevX1 !== null && (c.x0 - prevX1) > 8){ out.push(cell); cell = c.t; }
+      else cell = cell ? cell + " " + c.t : c.t;
+      prevX1 = c.x1;
+    }
+    if (cell) out.push(cell);
+    return out.join("\t");
+  }).join("\n");
+  const grab = re => { const m = text.match(re); return m ? m[1].trim() : ""; };
+
+  // Right-side label-value pairs all live in single tab-cells like
+  //   "Account Branch : KARIMNAGAR - TELANGANA"
+  // The ":" may or may not have a space before it depending on rendering;
+  // \s* accommodates both.
+  const number   = grab(/Account\s*No\s*:\s*(\d+)/i);
+  const ifsc     = grab(/RTGS\/NEFT\s*IFSC\s*:\s*([A-Z0-9]+)/i);
+  const micr     = grab(/MICR\s*:\s*(\d+)/i);
+  const branch   = grab(/Account\s*Branch\s*:\s*([^\t\n]+)/i);
+  const branchCd = grab(/Branch\s*Code\s*:\s*(\d+)/i);
+  const custId   = grab(/Cust\s*ID\s*:\s*(\d+)/i);
+  const type     = grab(/Account\s*Type\s*:\s*([^\t\n]+)/i);
+  const odLimit  = grab(/OD\s*Limit\s*:\s*(\d+)/i);
+  const currency = grab(/Currency\s*:\s*([A-Z]+)/i);
+  const from     = grab(/Statement\s*From\s*:\s*(\d{2}\/\d{2}\/\d{4})/i);
+  const to       = grab(/\bTo\s*:\s*(\d{2}\/\d{2}\/\d{4})/i);
+
+  // Account holder name lives on the LEFT side of the header. It's the
+  // first cell of the first body line where the left cell looks like a
+  // name (HDFC prints "M/S. RADHA AGENCIES" or just "FULL NAME"). Find it
+  // by walking lines and picking the first cell that starts at x0 < 200,
+  // is uppercase letters, and isn't a label keyword.
+  let name = "";
+  for (const line of lines){
+    const leftCells = line.cells.filter(c => c.x0 < 200).sort((a,b)=>a.x0-b.x0);
+    if (!leftCells.length) continue;
+    const t = leftCells.map(c => c.t).join(" ").trim();
+    if (/^(M\/S\.?|MR\.?|MRS\.?|MS\.?|DR\.?|[A-Z][A-Z ]{2,})/.test(t) &&
+        !/^(Joint|Nomination|Statement|Page|Account|Address|City|State|Phone|OD|Email|Cust|A\/C|Branch|RTGS|MICR)/i.test(t) &&
+        t.length < 60){
+      name = t; break;
+    }
+  }
+
+  return {
+    name, number, ifsc, micr, branch, branchCode: branchCd,
+    custId, type, odLimit, currency,
+    period: (from && to) ? `${from} – ${to}` : (from || to || "")
+  };
+}
+
+/* ============================================================
+   BANK OF BARODA (BoB) PARSER  — serial-anchored, MIDDLE anchor
+   Per-row pitch is a strict 22pt grid. Each transaction has a
+   serial number on a single "anchor" line that carries:
+     S.No | Txn Date | Value Date | (Debit OR Credit OR "-") |
+     Balance, plus optionally Cheque Number and short descriptions
+     written inline. LONG descriptions wrap into 1-2 visual lines
+     BOTH ABOVE AND BELOW the anchor — a layout no other supported
+     bank uses (Canara wraps below, Axis wraps above, SBI wraps two
+     columns below, BoB wraps both sides around the dated line).
+   Anchor = a line with integer S.No (xc<45), DD-MM-YYYY in tdate
+     column AND a balance amount — no keyword/skip list is needed;
+     headers, footers, the per-page "Account Statement from … to …"
+     title, and the address blocks all fail the anchor test.
+   Multi-statement PDFs (multiple quarters concatenated into one
+     file) are supported: each quarter starts with its own
+     "Opening Balance" row (sno=1, no debit/credit), whose balance
+     matches the previous quarter's closing — validated to zero
+     balance-chain breaks across 4 quarters / 1,243 transactions.
+   Date format: DD-MM-YYYY for both tdate and vdate.
+   ============================================================ */
+function bob_col(xc){
+  if (xc < 45)  return "sno";
+  if (xc < 95)  return "tdate";
+  if (xc < 145) return "vdate";
+  if (xc < 310) return "desc";
+  if (xc < 380) return "cheque";
+  if (xc < 450) return "debit";
+  if (xc < 520) return "credit";
+  return "balance";
+}
+const BOB_DATE = /^\d{2}-\d{2}-\d{4}$/;
+const BOB_AMT  = /^[\d,]+\.\d{2}$/;
+
+async function parseBoB(arrayBuffer, onProgress){
+  const pdf = await pdfjsLib.getDocument({ data: arrayBuffer }).promise;
+  const txns = [];
+  let account = null;
+  // Track every page's "Account Statement from X to Y" title to span
+  // multi-quarter PDFs correctly.
+  let periodFrom = null, periodTo = null;
+  const TITLE = /Account\s+Statement\s+from\s+(\d{2}-\d{2}-\d{4})\s+to\s+(\d{2}-\d{2}-\d{4})/i;
+
+  for (let p = 1; p <= pdf.numPages; p++){
+    const page = await pdf.getPage(p);
+    const H = page.getViewport({ scale: 1 }).height;
+    const tc = await page.getTextContent();
+    const items = [];
+    for (const it of tc.items){
+      const s = (it.str || "").trim();
+      if (!s) continue;
+      const x = it.transform[4], w = it.width || 0, top = H - it.transform[5];
+      items.push({ t:s, x0:x, x1:x+w, xc:x + w/2, top });
+    }
+    if (p === 1) account = bob_account(items);
+
+    // Period: scan for title on every page — a multi-quarter PDF
+    // has a different title per page-1-of-quarter, and we want the
+    // overall span min(from) .. max(to).
+    const lines = clusterLines(items);
+    for (const line of lines){
+      if (line.top > 170) break;       // title is near the top
+      const text = line.cells.slice().sort((a,b)=>a.x0-b.x0).map(c=>c.t).join(" ");
+      const m = TITLE.exec(text);
+      if (m){
+        if (!periodFrom || m[1] < periodFrom) periodFrom = m[1];
+        if (!periodTo   || m[2] > periodTo  ) periodTo   = m[2];
+        break;
+      }
+    }
+
+    // Identify anchor lines on this page
+    const anchors = [];
+    for (const line of lines){
+      const byCol = {};
+      for (const c of line.cells.slice().sort((u,v)=>u.xc-v.xc)){
+        const col = bob_col(c.xc);
+        (byCol[col] = byCol[col] || []).push(c);
+      }
+      const snoTxt   = (byCol.sno || []).map(c=>c.t).join("");
+      const tdateTxt = (byCol.tdate || []).map(c=>c.t).join("");
+      const balTxt   = (byCol.balance || []).map(c=>c.t).join("");
+      if (/^\d+$/.test(snoTxt) && BOB_DATE.test(tdateTxt) && BOB_AMT.test(balTxt)){
+        anchors.push({ top: line.top, line, byCol });
+      }
+    }
+    if (!anchors.length){ if (onProgress) onProgress(p, pdf.numPages); continue; }
+
+    // Define each anchor's y-range using midpoints to its neighbors.
+    // Pitch is a clean 22pt; the ±11 fallback for the first/last is
+    // safe because the first anchor is well below the table header
+    // and the last anchor is well above the page footer.
+    const anchorTops = new Set(anchors.map(a => Math.round(a.top * 10) / 10));
+    for (let i = 0; i < anchors.length; i++){
+      const a = anchors[i];
+      a.yLo = (i > 0) ? (anchors[i-1].top + a.top) / 2 : a.top - 11;
+      a.yHi = (i < anchors.length - 1) ? (anchors[i+1].top + a.top) / 2 : a.top + 11;
+    }
+
+    for (const a of anchors){
+      const descPieces = [];   // [top, x0, text]
+      // 1) desc cells on the anchor line itself ("Opening Balance" + short txn descs)
+      for (const c of (a.byCol.desc || [])) descPieces.push([a.top, c.x0, c.t]);
+      // 2) cells on non-anchor lines whose top falls inside this anchor's y-range
+      for (const line of lines){
+        const key = Math.round(line.top * 10) / 10;
+        if (anchorTops.has(key)) continue;
+        if (!(line.top > a.yLo && line.top <= a.yHi)) continue;
+        for (const c of line.cells.slice().sort((u,v)=>u.x0-v.x0)){
+          if (bob_col(c.xc) === "desc") descPieces.push([line.top, c.x0, c.t]);
+        }
+      }
+      descPieces.sort((p,q) => p[0] - q[0] || p[1] - q[1]);
+      const desc = descPieces.map(p => p[2]).join(" ").replace(/\s+/g," ").trim();
+
+      const debitTxt   = (a.byCol.debit   || []).map(c=>c.t).join("");
+      const creditTxt  = (a.byCol.credit  || []).map(c=>c.t).join("");
+      const balanceTxt = (a.byCol.balance || []).map(c=>c.t).join("");
+      const chequeTxt  = (a.byCol.cheque  || []).map(c=>c.t).join(" ").trim();
+      // "-" placeholder appears in the dr/cr column when empty;
+      // BOB_AMT rejects it naturally so toNum is never called on "-".
+      txns.push({
+        sno:     parseInt((a.byCol.sno || []).map(c=>c.t).join(""), 10),
+        tdate:   (a.byCol.tdate || []).map(c=>c.t).join(""),
+        vdate:   (a.byCol.vdate || []).map(c=>c.t).join(""),
+        desc,
+        cheque:  chequeTxt,
+        debit:   BOB_AMT.test(debitTxt)  ? toNum(debitTxt)  : null,
+        credit:  BOB_AMT.test(creditTxt) ? toNum(creditTxt) : null,
+        balance: toNum(balanceTxt)
+      });
+    }
+    if (onProgress) onProgress(p, pdf.numPages);
+  }
+
+  const A = account || {};
+  const period = (periodFrom && periodTo) ? `${periodFrom} – ${periodTo}` : (periodFrom || periodTo || "");
+  return {
+    period,
+    account: [
+      { label:"Account Name", value:A.name||"" },     { label:"Account Number", value:A.number||"" },
+      { label:"Account Type", value:A.type||"" },     { label:"IFSC Code", value:A.ifsc||"" },
+      { label:"MICR Code", value:A.micr||"" },        { label:"Branch", value:A.branch||"" },
+      { label:"Customer Address", value:A.address||"" },{ label:"Branch Address", value:A.branchAddress||"" },
+      { label:"Statement Period", value:period },     { label:"Total Transactions", value:String(txns.length) }
+    ],
+    columns: [
+      { key:"sno", label:"Serial No", type:"center", width:8 },
+      { key:"tdate", label:"Transaction Date", type:"center", width:14 },
+      { key:"vdate", label:"Value Date", type:"center", width:13 },
+      { key:"desc", label:"Description", type:"text", width:56 },
+      { key:"cheque", label:"Cheque Number", type:"center", width:13 },
+      { key:"debit", label:"Debit", type:"dr", width:16 },
+      { key:"credit", label:"Credit", type:"cr", width:16 },
+      { key:"balance", label:"Balance", type:"bal", width:18 }
+    ],
+    rows: txns
+  };
+}
+
+/* BoB account header is a TWO-COLUMN label-above-value-below grid.
+   Left column (x0≈27): Account Name / Number / Type / Customer Address
+   Right column (labels right-aligned at x0≈491+, values can begin
+   as far left as x0≈347 for the multi-line branch address): Branch
+   Name / IFSC / MICR / Branch Address. We walk clustered lines
+   top-down: when a line's joined left text exactly matches a known
+   label string, the next clustered line's left text is its value.
+   Same for right. For "Address" labels, values can span several
+   subsequent lines — we keep concatenating value-lines until the
+   next label row appears. The split between left and right by
+   x0=250 is safe: left values end well before x1=200, right values
+   start at x0≥300. */
+function bob_account(items){
+  const hdr = items.filter(i => i.top > 175 && i.top < 395);
+  const lines = clusterLines(hdr);
+  const leftText = ln => ln.cells.filter(c => c.x0 < 250).slice().sort((a,b)=>a.x0-b.x0).map(c=>c.t).join(" ").trim();
+  const rightText = ln => ln.cells.filter(c => c.x0 >= 300).slice().sort((a,b)=>a.x0-b.x0).map(c=>c.t).join(" ").trim();
+
+  const LEFT_LABELS = {
+    "account name": "name",
+    "account number": "number",
+    "account type": "type",
+    "customer address": "address"
+  };
+  const RIGHT_LABELS = {
+    "branch name": "branch",
+    "ifsc code": "ifsc",
+    "micr code": "micr",
+    "branch address": "branchAddress"
+  };
+  const isLeftLabel  = s => Object.prototype.hasOwnProperty.call(LEFT_LABELS,  s.toLowerCase());
+  const isRightLabel = s => Object.prototype.hasOwnProperty.call(RIGHT_LABELS, s.toLowerCase());
+
+  const out = {};
+  for (let i = 0; i < lines.length; i++){
+    const L = leftText(lines[i]), R = rightText(lines[i]);
+    if (isLeftLabel(L)){
+      const key = LEFT_LABELS[L.toLowerCase()];
+      if (/address/i.test(L)){
+        const parts = [];
+        for (let j = i + 1; j < lines.length; j++){
+          const nL = leftText(lines[j]), nR = rightText(lines[j]);
+          if (isLeftLabel(nL) || isRightLabel(nR)) break;
+          if (nL) parts.push(nL);
+        }
+        out[key] = parts.join(", ");
+      } else if (i + 1 < lines.length){
+        out[key] = leftText(lines[i + 1]);
+      }
+    }
+    if (isRightLabel(R)){
+      const key = RIGHT_LABELS[R.toLowerCase()];
+      if (/address/i.test(R)){
+        const parts = [];
+        for (let j = i + 1; j < lines.length; j++){
+          const nL = leftText(lines[j]), nR = rightText(lines[j]);
+          if (isLeftLabel(nL) || isRightLabel(nR)) break;
+          if (nR) parts.push(nR);
+        }
+        out[key] = parts.join(", ");
+      } else if (i + 1 < lines.length){
+        out[key] = rightText(lines[i + 1]);
+      }
+    }
+  }
+  return out;
 }
 
 /* ============================================================
