@@ -1,0 +1,1082 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Ledgerly — Bank statement to Excel, in your browser</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,500;9..144,600&family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600&display=swap" rel="stylesheet">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/exceljs/4.4.0/exceljs.min.js"></script>
+<style>
+  :root{
+    --ink:#14233A; --ink-2:#3C4A60; --muted:#6B7686;
+    --paper:#EEF2F6; --surface:#FFFFFF; --surface-2:#F7F9FB;
+    --line:#D7DEE7; --line-strong:#C2CCD8;
+    --teal:#0B6E5B; --teal-deep:#085546; --teal-tint:#E2F0EC;
+    --amber:#9A5B00; --amber-tint:#F6ECDC;
+    --red:#B42318; --green:#0B6E5B;
+    --shadow:0 1px 2px rgba(20,35,58,.06), 0 8px 28px rgba(20,35,58,.07);
+    --radius:14px;
+  }
+  *{box-sizing:border-box}
+  html,body{margin:0;padding:0}
+  body{
+    font-family:'IBM Plex Sans',system-ui,sans-serif;
+    background:
+      linear-gradient(var(--paper),var(--paper)),
+      repeating-linear-gradient(transparent,transparent 31px,rgba(120,135,160,.06) 32px);
+    color:var(--ink); line-height:1.5; -webkit-font-smoothing:antialiased;
+  }
+  .wrap{max-width:1020px;margin:0 auto;padding:0 22px}
+  .mono{font-family:'IBM Plex Mono',monospace;font-variant-numeric:tabular-nums}
+
+  /* Header */
+  header{padding:30px 0 18px}
+  .topbar{display:flex;align-items:center;justify-content:space-between;gap:16px;flex-wrap:wrap}
+  .brand{display:flex;align-items:baseline;gap:12px}
+  .brand h1{font-family:'Fraunces',serif;font-weight:600;font-size:30px;letter-spacing:-.01em;margin:0;color:var(--ink)}
+  .brand .tag{font-size:12.5px;color:var(--muted);letter-spacing:.02em}
+  .privacy{
+    display:inline-flex;align-items:center;gap:9px;background:var(--teal-tint);
+    color:var(--teal-deep);border:1px solid #BFE0D8;border-radius:999px;
+    padding:8px 14px;font-size:12.5px;font-weight:500
+  }
+  .privacy .dot{width:7px;height:7px;border-radius:50%;background:var(--teal);box-shadow:0 0 0 3px rgba(11,110,91,.18)}
+
+  .lede{margin:22px 0 6px;font-family:'Fraunces',serif;font-weight:500;font-size:25px;line-height:1.25;letter-spacing:-.01em;max-width:30ch}
+  .lede em{font-style:italic;color:var(--teal-deep)}
+  .sub{color:var(--ink-2);font-size:15px;max-width:62ch;margin:0 0 8px}
+
+  .rule{height:1px;background:var(--line);margin:24px 0}
+
+  /* Step labels */
+  .step{display:flex;align-items:center;gap:10px;margin:26px 0 14px}
+  .step .k{font-family:'IBM Plex Mono',monospace;font-size:11px;letter-spacing:.16em;text-transform:uppercase;color:var(--muted)}
+  .step .k b{color:var(--teal-deep);font-weight:600}
+  .step h2{font-size:16px;font-weight:600;margin:0;letter-spacing:-.01em}
+
+  /* Bank grid — ledger cells */
+  .grid{display:grid;grid-template-columns:repeat(4,1fr);gap:0;border:1px solid var(--line-strong);border-radius:var(--radius);overflow:hidden;background:var(--surface)}
+  .cell{
+    position:relative;text-align:left;background:var(--surface);border:0;cursor:pointer;
+    padding:16px 15px 15px;min-height:104px;
+    border-right:1px solid var(--line);border-bottom:1px solid var(--line);
+    display:flex;flex-direction:column;gap:8px;transition:background .15s ease, transform .15s ease;
+    font-family:inherit;color:inherit
+  }
+  .grid .cell:nth-child(4n){border-right:0}
+  .cell .code{display:flex;align-items:center;gap:9px}
+  .cell .swatch{width:11px;height:11px;border-radius:3px;flex:none}
+  .cell .abbr{font-family:'IBM Plex Mono',monospace;font-weight:600;font-size:13px;letter-spacing:.04em}
+  .cell .name{font-size:13px;color:var(--ink-2);line-height:1.35}
+  .cell .state{margin-top:auto;font-family:'IBM Plex Mono',monospace;font-size:10.5px;letter-spacing:.12em;text-transform:uppercase;color:var(--muted)}
+  .cell.ready .state{color:var(--teal-deep)}
+  .cell.ready:hover{background:var(--teal-tint);transform:translateY(-1px)}
+  .cell.ready.active{background:var(--teal-tint);box-shadow:inset 0 0 0 2px var(--teal)}
+  .cell.soon{cursor:not-allowed}
+  .cell.soon .abbr,.cell.soon .name{opacity:.5}
+  .cell .arrow{position:absolute;right:13px;top:14px;color:var(--teal);opacity:0;transform:translateX(-4px);transition:.15s}
+  .cell.ready:hover .arrow,.cell.ready.active .arrow{opacity:1;transform:none}
+
+  /* Converter panel */
+  .panel{margin-top:18px;background:var(--surface);border:1px solid var(--line-strong);border-radius:var(--radius);box-shadow:var(--shadow);overflow:hidden;display:none}
+  .panel.show{display:block;animation:rise .28s ease both}
+  @keyframes rise{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:none}}
+  .panel-head{display:flex;align-items:center;gap:12px;padding:16px 20px;border-bottom:1px solid var(--line);background:var(--surface-2)}
+  .panel-head .swatch{width:13px;height:13px;border-radius:3px}
+  .panel-head .pt{font-weight:600;font-size:15px}
+  .panel-head .ps{font-size:12.5px;color:var(--muted)}
+  .panel-body{padding:20px}
+
+  /* Drop zone */
+  .drop{
+    border:1.5px dashed var(--line-strong);border-radius:12px;background:var(--surface-2);
+    padding:34px 22px;text-align:center;transition:.18s;cursor:pointer
+  }
+  .drop:hover,.drop.over{border-color:var(--teal);background:var(--teal-tint)}
+  .drop .ic{font-size:26px;line-height:1}
+  .drop .big{font-weight:600;margin-top:10px;font-size:15px}
+  .drop .small{color:var(--muted);font-size:13px;margin-top:4px}
+  .drop .browse{color:var(--teal-deep);font-weight:600;text-decoration:underline;text-underline-offset:2px}
+  input[type=file]{display:none}
+
+  /* Progress */
+  .work{display:none;padding:6px 2px 2px}
+  .work.show{display:block}
+  .bar{height:8px;border-radius:999px;background:var(--surface-2);border:1px solid var(--line);overflow:hidden}
+  .bar > i{display:block;height:100%;width:0;background:linear-gradient(90deg,var(--teal),var(--teal-deep));transition:width .2s ease}
+  .work .lbl{margin-top:9px;font-size:13px;color:var(--ink-2)}
+  .work .lbl .mono{color:var(--ink)}
+
+  /* Result */
+  .result{display:none;animation:rise .28s ease both}
+  .result.show{display:block}
+  .summary{display:grid;grid-template-columns:repeat(4,1fr);gap:1px;background:var(--line);border:1px solid var(--line);border-radius:12px;overflow:hidden}
+  .summary .m{background:var(--surface);padding:14px 14px 12px}
+  .summary .m .v{font-family:'IBM Plex Mono',monospace;font-weight:600;font-size:18px;letter-spacing:-.01em}
+  .summary .m .v.dr{color:var(--red)} .summary .m .v.cr{color:var(--green)}
+  .summary .m .l{font-size:11px;letter-spacing:.04em;text-transform:uppercase;color:var(--muted);margin-top:3px}
+  .acct{margin-top:14px;font-size:13px;color:var(--ink-2);background:var(--surface-2);border:1px solid var(--line);border-radius:10px;padding:12px 14px}
+  .acct b{color:var(--ink);font-weight:600}
+  .acct .row{display:flex;gap:6px;flex-wrap:wrap}
+  .actions{display:flex;gap:10px;flex-wrap:wrap;margin-top:16px}
+  .btn{
+    font-family:inherit;font-size:14px;font-weight:600;border-radius:10px;padding:11px 18px;cursor:pointer;border:1px solid transparent;transition:.15s
+  }
+  .btn.primary{background:var(--teal);color:#fff}
+  .btn.primary:hover{background:var(--teal-deep)}
+  .btn.ghost{background:var(--surface);color:var(--ink);border-color:var(--line-strong)}
+  .btn.ghost:hover{background:var(--surface-2)}
+
+  /* Error */
+  .err{display:none;margin-top:14px;background:#FCEDEA;border:1px solid #F1C7BF;color:#7A2218;border-radius:10px;padding:12px 14px;font-size:13.5px}
+  .err.show{display:block}
+  .err b{font-weight:600}
+
+  /* Preview table — mirrors the Excel */
+  .preview{margin-top:20px;border-top:1px solid var(--line);padding-top:16px;display:none}
+  .preview.show{display:block;animation:rise .28s ease both}
+  .preview .ph{display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;margin-bottom:11px}
+  .preview .lab{font-family:'IBM Plex Mono',monospace;font-size:11px;letter-spacing:.1em;text-transform:uppercase;color:var(--muted)}
+  .preview .search{font-family:inherit;font-size:13px;border:1px solid var(--line-strong);border-radius:8px;padding:8px 12px;min-width:220px;background:var(--surface);color:var(--ink)}
+  .preview .search:focus{outline:none;border-color:var(--teal);box-shadow:0 0 0 3px rgba(11,110,91,.12)}
+  .tableWrap{max-height:440px;overflow:auto;border:1px solid var(--line-strong);border-radius:10px}
+  table.xl{border-collapse:separate;border-spacing:0;width:100%;font-size:12.5px}
+  table.xl th{position:sticky;top:0;background:var(--ink);color:#fff;font-weight:600;padding:9px 10px;text-align:left;white-space:nowrap;font-size:10.5px;letter-spacing:.04em;z-index:2}
+  table.xl th.r{text-align:right}
+  table.xl td{padding:7px 10px;border-bottom:1px solid var(--line);vertical-align:top;color:var(--ink)}
+  table.xl tbody tr:nth-child(even) td{background:var(--surface-2)}
+  table.xl td.c{text-align:center;white-space:nowrap}
+  table.xl td.num{text-align:right;white-space:nowrap;font-family:'IBM Plex Mono',monospace;font-variant-numeric:tabular-nums}
+  table.xl td.mono{font-family:'IBM Plex Mono',monospace}
+  table.xl td.desc{min-width:240px;max-width:360px;color:var(--ink-2)}
+  table.xl td.dr{color:var(--red)} table.xl td.cr{color:var(--green)}
+  table.xl td.empty{color:var(--muted)}
+  .preview .none{padding:24px;text-align:center;color:var(--muted);font-size:13px}
+
+  footer{color:var(--muted);font-size:12.5px;padding:30px 0 50px;line-height:1.7}
+  footer code{font-family:'IBM Plex Mono',monospace;background:var(--surface);border:1px solid var(--line);border-radius:5px;padding:1px 6px;font-size:11.5px}
+
+  @media(max-width:760px){
+    .grid{grid-template-columns:repeat(2,1fr)}
+    .grid .cell:nth-child(4n){border-right:1px solid var(--line)}
+    .grid .cell:nth-child(2n){border-right:0}
+    .summary{grid-template-columns:repeat(2,1fr)}
+    .brand h1{font-size:26px}.lede{font-size:22px}
+  }
+  @media(prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important}}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <div class="topbar">
+      <div class="brand">
+        <h1>Ledgerly</h1>
+        <span class="tag">PDF statements → clean Excel</span>
+      </div>
+      <span class="privacy"><span class="dot"></span>Your file never leaves this browser</span>
+    </div>
+    <p class="lede">Turn a bank statement PDF into a <em>tidy spreadsheet</em> — no upload, no account.</p>
+    <p class="sub">Everything runs locally on this page: the PDF is read in your browser and the Excel file is built on your own machine. Pick your bank to begin.</p>
+  </header>
+
+  <div class="rule"></div>
+
+  <div class="step">
+    <span class="k">Step <b>01</b></span>
+    <h2>Choose your bank</h2>
+  </div>
+  <div class="grid" id="grid"></div>
+
+  <div class="step" id="step2" style="opacity:.45">
+    <span class="k">Step <b>02</b></span>
+    <h2>Add your statement</h2>
+  </div>
+
+  <div class="panel" id="panel">
+    <div class="panel-head">
+      <span class="swatch" id="phSwatch"></span>
+      <div>
+        <div class="pt" id="phTitle">—</div>
+        <div class="ps" id="phSub">Drop a statement PDF and download a formatted .xlsx</div>
+      </div>
+    </div>
+    <div class="panel-body">
+      <div class="drop" id="drop">
+        <div class="ic">↧</div>
+        <div class="big">Drop your statement PDF here</div>
+        <div class="small">or <span class="browse">browse files</span> · PDF only · stays on your device</div>
+        <input type="file" id="file" accept="application/pdf,.pdf">
+      </div>
+
+      <div class="work" id="work">
+        <div class="bar"><i id="barFill"></i></div>
+        <div class="lbl" id="workLbl">Reading…</div>
+      </div>
+
+      <div class="err" id="err"></div>
+
+      <div class="result" id="result">
+        <div class="summary">
+          <div class="m"><div class="v mono" id="mCount">0</div><div class="l">Transactions</div></div>
+          <div class="m"><div class="v mono" id="mPeriod">—</div><div class="l">Period</div></div>
+          <div class="m"><div class="v mono dr" id="mDr">0</div><div class="l" id="mDrL">Total out</div></div>
+          <div class="m"><div class="v mono cr" id="mCr">0</div><div class="l" id="mCrL">Total in</div></div>
+        </div>
+        <div class="acct" id="acct"></div>
+        <div class="actions">
+          <button class="btn primary" id="dl">Download Excel</button>
+          <button class="btn ghost" id="again">Convert another</button>
+        </div>
+
+        <div class="preview" id="preview">
+          <div class="ph">
+            <span class="lab" id="pvCount">—</span>
+            <input class="search" id="pvSearch" type="text" placeholder="Filter rows…" autocomplete="off">
+          </div>
+          <div class="tableWrap">
+            <table class="xl">
+              <thead id="pvHead"></thead>
+              <tbody id="pvBody"></tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <footer>
+  </footer>
+</div>
+
+<script>
+pdfjsLib.GlobalWorkerOptions.workerSrc = "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js";
+
+const PDF_WORKER_URL = "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js";
+let workerReady = null;
+function ensureWorker(){
+  if (workerReady) return workerReady;
+  workerReady = (async () => {
+    try {
+      const res = await fetch(PDF_WORKER_URL);
+      if (!res.ok) throw new Error("worker fetch " + res.status);
+      pdfjsLib.GlobalWorkerOptions.workerSrc = URL.createObjectURL(await res.blob());
+    } catch (e) {
+      pdfjsLib.GlobalWorkerOptions.workerSrc = PDF_WORKER_URL;
+    }
+  })();
+  return workerReady;
+}
+function librariesLoaded(){ return typeof pdfjsLib !== "undefined" && typeof ExcelJS !== "undefined"; }
+function withTimeout(promise, ms, msg){
+  let to;
+  const guard = new Promise((_, rej) => { to = setTimeout(() => rej(new Error(msg)), ms); });
+  return Promise.race([ promise.finally(() => clearTimeout(to)), guard ]);
+}
+
+/* ============================================================
+   BANK REGISTRY  (the "decisive routing" lives here)
+   Each bank declares its own parser. A parser returns a
+   normalized result: { account[], columns[], rows[], period }.
+   Add a bank = add an entry + a parse function. Nothing else
+   in the app is bank-specific.
+   ============================================================ */
+const BANKS = [
+  { id:"icici",   abbr:"ICICI", name:"ICICI Bank",          color:"#AE2024", parser:parseICICI },
+  { id:"indian",  abbr:"INDB",  name:"Indian Bank",          color:"#1A4B8C", parser:parseIndianBank },
+  { id:"gcub",    abbr:"GCUB",  name:"Gayatri Co-op Urban",   color:"#2E7D32", parser:parseGayatri },
+  { id:"canara",  abbr:"CNRB",  name:"Canara Bank",          color:"#00529B", parser:parseCanara },
+  { id:"sbi",     abbr:"SBI",   name:"State Bank of India",  color:"#1B3A8B", parser:null },
+  { id:"hdfc",    abbr:"HDFC",  name:"HDFC Bank",            color:"#13357B", parser:null },
+  { id:"axis",    abbr:"AXIS",  name:"Axis Bank",            color:"#97144D", parser:null },
+  { id:"kotak",   abbr:"KOTAK", name:"Kotak Mahindra",       color:"#B5121B", parser:null },
+  { id:"bob",     abbr:"BOB",   name:"Bank of Baroda",       color:"#E35205", parser:null },
+  { id:"pnb",     abbr:"PNB",   name:"Punjab National",      color:"#A5235A", parser:null },
+];
+const REGISTRY = Object.fromEntries(BANKS.map(b => [b.id, b]));
+let selected = null;
+
+/* ---------- shared geometry helpers ---------- */
+function clusterLines(items, tol){
+  tol = tol || 3;
+  items.sort((a,b)=> a.top - b.top || a.x0 - b.x0);
+  const lines = [];
+  for (const it of items){
+    const last = lines[lines.length-1];
+    if (last && Math.abs(it.top - last.top) <= tol) last.cells.push(it);
+    else lines.push({ top: it.top, cells: [it] });
+  }
+  return lines;
+}
+function toNum(s){
+  if (s === null || s === undefined || s === "") return null;
+  const n = parseFloat(String(s).replace(/[,\s₹]/g,""));
+  return isNaN(n) ? null : n;
+}
+
+/* ============================================================
+   ICICI PARSER  (serial-numbered rows; balance has '-' prefix)
+   ============================================================ */
+function icici_col(xc){
+  if (xc < 90)  return "sno";
+  if (xc < 155) return "txnId";
+  if (xc < 225) return "date";
+  if (xc < 290) return "cheque";
+  if (xc < 355) return "desc";
+  if (xc < 420) return "withdrawal";
+  if (xc < 490) return "deposit";
+  return "balance";
+}
+const ICICI_DATE = /^\d{1,2}-[A-Za-z]{3}-/;
+
+async function parseICICI(arrayBuffer, onProgress){
+  const pdf = await pdfjsLib.getDocument({ data: arrayBuffer }).promise;
+  const txns = [];
+  let account = null, done = false;
+
+  for (let p = 1; p <= pdf.numPages && !done; p++){
+    const page = await pdf.getPage(p);
+    const H = page.getViewport({ scale: 1 }).height;
+    const tc = await page.getTextContent();
+    const items = [];
+    for (const it of tc.items){
+      const s = (it.str || "").trim();
+      if (!s) continue;
+      const x = it.transform[4], w = it.width || 0, top = H - it.transform[5];
+      if (top > 770) continue;
+      items.push({ t:s, x0:x, x1:x+w, xc:x + w/2, top });
+    }
+    if (p === 1) account = icici_account(items);
+
+    const lines = clusterLines(items);
+    let cur = null;
+    for (const line of lines){
+      if (line.cells.map(c=>c.t).join(" ").indexOf("Legends Used") !== -1){ done = true; break; }
+      const b = {};
+      for (const c of line.cells.slice().sort((p,q)=>p.xc-q.xc)) (b[icici_col(c.xc)] = b[icici_col(c.xc)] || []).push(c.t);
+      const sno = (b.sno || []).join(""), date = (b.date || []).join("");
+      if (/^\d+$/.test(sno) && ICICI_DATE.test(date)){
+        if (cur) txns.push(cur);
+        cur = { sno, txnId:"", date:"", cheque:"", desc:[], withdrawal:"", deposit:"", balance:"" };
+      }
+      if (!cur) continue;
+      cur.txnId += (b.txnId || []).join("");
+      cur.date  += (b.date  || []).join("");
+      if (b.cheque) cur.cheque += b.cheque.join(" ");
+      if (b.desc)   cur.desc = cur.desc.concat(b.desc);
+      if (b.withdrawal && !cur.withdrawal) cur.withdrawal = b.withdrawal.join("");
+      if (b.deposit   && !cur.deposit)     cur.deposit   = b.deposit.join("");
+      if (b.balance)  cur.balance += b.balance.join("");
+    }
+    if (cur) txns.push(cur);
+    if (onProgress) onProgress(p, pdf.numPages);
+  }
+
+  const rows = txns.map(t => ({
+    sno: parseInt(t.sno, 10), txnId: t.txnId, date: t.date, cheque: t.cheque.trim(),
+    desc: t.desc.join(" ").replace(/\s+/g," ").trim(),
+    withdrawal: toNum(t.withdrawal), deposit: toNum(t.deposit), balance: icici_bal(t.balance)
+  }));
+
+  const A = account || {};
+  return {
+    period: A.period || "",
+    account: [
+      { label:"Account Name", value:A.name||"" },   { label:"Account Type", value:A.type||"" },
+      { label:"Account Number", value:A.number||"" },{ label:"IFSC Code", value:A.ifsc||"" },
+      { label:"Customer ID", value:A.custId||"" },   { label:"Currency", value:A.currency||"" },
+      { label:"Statement Period", value:A.period||"" }, { label:"Total Transactions", value:String(rows.length) }
+    ],
+    columns: [
+      { key:"sno", label:"S.No", type:"center", width:7 },
+      { key:"txnId", label:"Transaction ID", type:"mono", width:16 },
+      { key:"date", label:"Transaction Date", type:"center", width:16 },
+      { key:"cheque", label:"Cheque No", type:"center", width:14 },
+      { key:"desc", label:"Description", type:"text", width:52 },
+      { key:"withdrawal", label:"Withdrawal (Dr)", type:"dr", width:18 },
+      { key:"deposit", label:"Deposit (Cr)", type:"cr", width:18 },
+      { key:"balance", label:"Available Balance", type:"bal", width:20 }
+    ],
+    rows
+  };
+}
+function icici_bal(s){
+  if (!s) return null;
+  s = String(s).trim();
+  const neg = s.startsWith("-");
+  const n = toNum(s.replace(/-/g,""));
+  return n === null ? null : (neg ? -n : n);
+}
+function icici_account(items){
+  const top = items.filter(i => i.top < 340);
+  const lines = clusterLines(top);
+  const text = lines.map(line => {
+    const cs = line.cells.slice().sort((a,b)=>a.x0-b.x0);
+    let out = [], cell = "", prevX1 = null;
+    for (const c of cs){
+      if (prevX1 !== null && (c.x0 - prevX1) > 8){ out.push(cell); cell = c.t; }
+      else cell = cell ? cell + " " + c.t : c.t;
+      prevX1 = c.x1;
+    }
+    if (cell) out.push(cell);
+    return out.join("\t");
+  }).join("\n");
+  const grab = re => { const m = text.match(re); return m ? m[1].trim() : ""; };
+  let name = grab(/Account name:\t+([^\t\n]+)/i);
+  const linesArr = text.split("\n");
+  const idx = linesArr.findIndex(l => /Account name:/i.test(l));
+  if (idx > -1 && linesArr[idx+1]){
+    const fc = linesArr[idx+1].split("\t")[0].trim();
+    if (/^[A-Z][A-Z .&-]+$/.test(fc) && !/:/.test(fc)) name = (name + " " + fc).trim();
+  }
+  return {
+    name,
+    type: grab(/Account type:\t+([^\t\n]+)/i),
+    number: grab(/Account number:\t+([^\t\n]+)/i),
+    currency: grab(/Account currency:\t+([^\t\n]+)/i),
+    ifsc: grab(/IFSC code:\t+([^\t\n]+)/i),
+    custId: grab(/Customer ID:\t+([^\t\n]+)/i),
+    period: grab(/transactions from\s+([^\t\n]+)/i).replace(/\s*-\s*/, " – ")
+  };
+}
+
+/* ============================================================
+   INDIAN BANK PARSER  (no serial; date/amount line sits inside
+   a multi-line block; balance has Cr/Dr suffix). Transactions
+   are isolated by vertical gaps; an anchor is any line carrying
+   BOTH a date and a balance — so no keyword list is needed.
+   ============================================================ */
+function indb_col(xc){
+  if (xc < 88)  return "postDate";
+  if (xc < 140) return "valueDate";
+  if (xc < 360) return "details";
+  if (xc < 388) return "chq";
+  if (xc < 435) return "debit";
+  if (xc < 490) return "credit";
+  return "balance";
+}
+const INDB_DATE = /^\d{2}\/\d{2}\/\d{2}$/;
+const INDB_BAL  = /^([\d,]+\.\d{2})(Cr|Dr)$/i;
+const INDB_GAP  = 12;
+
+async function parseIndianBank(arrayBuffer, onProgress){
+  const pdf = await pdfjsLib.getDocument({ data: arrayBuffer }).promise;
+  const txns = [];
+  let account = null;
+
+  for (let p = 1; p <= pdf.numPages; p++){
+    const page = await pdf.getPage(p);
+    const H = page.getViewport({ scale: 1 }).height;
+    const tc = await page.getTextContent();
+    const items = [];
+    for (const it of tc.items){
+      const s = (it.str || "").trim();
+      if (!s) continue;
+      const x = it.transform[4], w = it.width || 0, top = H - it.transform[5];
+      items.push({ t:s, x0:x, x1:x+w, xc:x + w/2, top });
+    }
+    if (p === 1) account = indb_account(items);
+
+    const lines = clusterLines(items);
+    // group lines into blocks by vertical gap
+    const blocks = [];
+    for (const ln of lines){
+      const last = blocks[blocks.length-1];
+      if (last && (ln.top - last.btm) <= INDB_GAP){ last.lines.push(ln); last.btm = ln.top; }
+      else blocks.push({ lines:[ln], btm: ln.top });
+    }
+    for (const blk of blocks){
+      let anchor = null;
+      const details = [];
+      for (const ln of blk.lines){
+        const b = {};
+        for (const c of ln.cells.slice().sort((p,q)=>p.xc-q.xc)) (b[indb_col(c.xc)] = b[indb_col(c.xc)] || []).push(c.t);
+        const pd = (b.postDate || []).join(""), bal = (b.balance || []).join("");
+        if (INDB_DATE.test(pd) && INDB_BAL.test(bal)) anchor = b;
+        if (b.details) details.push.apply(details, b.details);
+      }
+      if (!anchor) continue;                       // header / brought-forward / summary blocks
+      const m = INDB_BAL.exec((anchor.balance || []).join(""));
+      let bal = toNum(m[1]); if (m[2].toUpperCase() === "DR") bal = -bal;
+      txns.push({
+        postDate: (anchor.postDate || []).join(""),
+        valueDate: (anchor.valueDate || []).join(""),
+        details: details.join(" ").replace(/\s+/g," ").trim(),
+        chq: (anchor.chq || []).join(" ").trim(),
+        debit: toNum((anchor.debit || []).join("")),
+        credit: toNum((anchor.credit || []).join("")),
+        balance: bal
+      });
+    }
+    if (onProgress) onProgress(p, pdf.numPages);
+  }
+
+  const A = account || {};
+  return {
+    period: A.period || "",
+    account: [
+      { label:"Account Name", value:A.name||"" },   { label:"Account Number", value:A.number||"" },
+      { label:"Branch", value:A.branch||"" },        { label:"IFSC Code", value:A.ifsc||"" },
+      { label:"Currency", value:A.currency||"" },    { label:"Statement Period", value:A.period||"" },
+      { label:"Total Transactions", value:String(txns.length) }
+    ],
+    columns: [
+      { key:"postDate", label:"Post Date", type:"center", width:13 },
+      { key:"valueDate", label:"Value Date", type:"center", width:13 },
+      { key:"details", label:"Details", type:"text", width:58 },
+      { key:"chq", label:"Chq.No", type:"center", width:12 },
+      { key:"debit", label:"Debit", type:"dr", width:16 },
+      { key:"credit", label:"Credit", type:"cr", width:16 },
+      { key:"balance", label:"Balance", type:"bal", width:18 }
+    ],
+    rows: txns
+  };
+}
+function indb_account(items){
+  const top = items.filter(i => i.top < 300);
+  const lines = clusterLines(top);
+  const text = lines.map(line => {
+    const cs = line.cells.slice().sort((a,b)=>a.x0-b.x0);
+    let out = [], cell = "", prevX1 = null;
+    for (const c of cs){
+      if (prevX1 !== null && (c.x0 - prevX1) > 8){ out.push(cell); cell = c.t; }
+      else cell = cell ? cell + " " + c.t : c.t;
+      prevX1 = c.x1;
+    }
+    if (cell) out.push(cell);
+    return out.join("\t");
+  }).join("\n");
+  const grab = re => { const m = text.match(re); return m ? m[1].trim() : ""; };
+  const from = grab(/Statement From\s*:?\s*([0-9A-Za-z-]+)/i);
+  const to   = grab(/\bTo\s*:?\s*([0-9]{2}-[A-Za-z]{3}-[0-9]{4})/i);
+  // account holder name: first tab-cell of the line just below "STATEMENT OF ACCOUNT"
+  let name = "";
+  const arr = text.split("\n");
+  const hi = arr.findIndex(l => /STATEMENT OF ACCOUNT/i.test(l));
+  if (hi > -1 && arr[hi+1]) name = arr[hi+1].split("\t")[0].trim();
+  const branch = grab(/([A-Z][A-Z ]*BRANCH)/);
+  return {
+    name,
+    number: grab(/Account No\s*:?\s*([0-9]+)/i),
+    ifsc: grab(/IFSC Code\s*:?\s*([A-Z0-9]+)/i),
+    branch,
+    currency: grab(/Currency\s*:?\s*([A-Za-z]+)/i),
+    period: (from && to) ? `${from} – ${to}` : (from || to || "")
+  };
+}
+
+/* ============================================================
+   GAYATRI CO-OP URBAN BANK PARSER
+   Serial-numbered like ICICI, but Debit & Credit are separate
+   columns (the unused side prints "0.00"), dates are
+   'DD/Mon/YYYY, and Closing Balance is a plain positive number.
+   ============================================================ */
+function gcub_col(xc){
+  if (xc < 55)  return "srNo";
+  if (xc < 117) return "valueDate";
+  if (xc < 178) return "txnDate";
+  if (xc < 300) return "particulars";
+  if (xc < 360) return "chq";
+  if (xc < 445) return "debit";
+  if (xc < 512) return "credit";
+  return "balance";
+}
+const GCUB_DATE = /^'?\d{2}\/[A-Za-z]{3}\/\d{4}$/;
+
+async function parseGayatri(arrayBuffer, onProgress){
+  const pdf = await pdfjsLib.getDocument({ data: arrayBuffer }).promise;
+  const out = [];
+  let account = null, cur = null;
+
+  for (let p = 1; p <= pdf.numPages; p++){
+    const page = await pdf.getPage(p);
+    const H = page.getViewport({ scale: 1 }).height;
+    const tc = await page.getTextContent();
+    const items = [];
+    for (const it of tc.items){
+      const s = (it.str || "").trim();
+      if (!s) continue;
+      const x = it.transform[4], w = it.width || 0, top = H - it.transform[5];
+      items.push({ t:s, x0:x, x1:x+w, xc:x + w/2, top });
+    }
+    if (p === 1) account = gcub_account(items);
+
+    const lines = clusterLines(items);
+    for (const line of lines){
+      const b = {};
+      for (const c of line.cells.slice().sort((p,q)=>p.xc-q.xc)) (b[gcub_col(c.xc)] = b[gcub_col(c.xc)] || []).push(c.t);
+      const srno = (b.srNo || []).join(""), vdate = (b.valueDate || []).join("");
+      if (/^\d+$/.test(srno) && GCUB_DATE.test(vdate)){
+        if (cur) out.push(cur);
+        cur = { srno: parseInt(srno,10), valueDate: vdate.replace(/^'/,""),
+                txnDate: (b.txnDate||[]).join("").replace(/^'/,""),
+                particulars: [], chq: "", debit: null, credit: null, balance: null };
+      }
+      if (!cur) continue;
+      if (b.particulars) cur.particulars = cur.particulars.concat(b.particulars);
+      if (b.chq){ const v = b.chq.join(""); if (v && v !== "000000" && !cur.chq) cur.chq = v; }
+      for (const col of ["debit","credit","balance"]){
+        if (b[col] && cur[col] === null){
+          const v = toNum(b[col].join(""));
+          if (v !== null) cur[col] = v;
+        }
+      }
+    }
+  }
+  if (cur) out.push(cur);
+
+  const rows = out.map(t => ({
+    srno: t.srno, valueDate: t.valueDate, txnDate: t.txnDate,
+    particulars: t.particulars.join(" ").replace(/\s+/g," ").trim(),
+    chq: t.chq,
+    debit:  (t.debit  && t.debit  > 0) ? t.debit  : null,
+    credit: (t.credit && t.credit > 0) ? t.credit : null,
+    balance: t.balance
+  }));
+
+  const A = account || {};
+  return {
+    period: A.period || "",
+    account: [
+      { label:"Account Name", value:A.name||"" },   { label:"Account Number", value:A.number||"" },
+      { label:"Bank / Branch", value:A.branch||"" },{ label:"IFSC Code", value:A.ifsc||"" },
+      { label:"Account Type", value:A.type||"" },    { label:"Statement Period", value:A.period||"" },
+      { label:"Total Transactions", value:String(rows.length) }
+    ],
+    columns: [
+      { key:"srno", label:"Sr. No", type:"center", width:7 },
+      { key:"valueDate", label:"Value Date", type:"center", width:14 },
+      { key:"txnDate", label:"Transaction Date", type:"center", width:14 },
+      { key:"particulars", label:"Particulars", type:"text", width:54 },
+      { key:"chq", label:"Chq./Ref. No", type:"center", width:14 },
+      { key:"debit", label:"Debit", type:"dr", width:16 },
+      { key:"credit", label:"Credit", type:"cr", width:16 },
+      { key:"balance", label:"Closing Balance", type:"bal", width:18 }
+    ],
+    rows
+  };
+}
+function gcub_account(items){
+  const top = items.filter(i => i.top < 290);
+  const lines = clusterLines(top);
+  const text = lines.map(line => {
+    const cs = line.cells.slice().sort((a,b)=>a.x0-b.x0);
+    let out = [], cell = "", prevX1 = null;
+    for (const c of cs){
+      if (prevX1 !== null && (c.x0 - prevX1) > 10){ out.push(cell); cell = c.t; }
+      else cell = cell ? cell + " " + c.t : c.t;
+      prevX1 = c.x1;
+    }
+    if (cell) out.push(cell);
+    return out.join("\t");
+  }).join("\n");
+  const grab = re => { const m = text.match(re); return m ? m[1].trim() : ""; };
+  const from = grab(/FROM\s*([0-9]{2}\/[A-Za-z]{3}\/[0-9]{4})/i);
+  const to   = grab(/\bTO\s*([0-9]{2}\/[A-Za-z]{3}\/[0-9]{4})/i);
+  return {
+    name:   grab(/Customer\s*Name\s*:\s*([^\t\n|]+)/i),
+    number: grab(/Account\s*No\s*:\s*'?([0-9]+)/i),
+    ifsc:   grab(/IFSC\s*Code\s*:\s*([A-Z0-9]+)/i),
+    branch: grab(/Branch\s*Name\s*:\s*([^\t\n|]+)/i),
+    type:   grab(/Account\s*Type\s*:\s*([A-Za-z0-9 /-]+)/i),
+    period: (from && to) ? `${from} – ${to}` : (from || to || "")
+  };
+}
+
+/* ============================================================
+   CANARA BANK PARSER  (no serial; date, amount & balance share
+   ONE anchor line, with the description wrapping below it).
+   Separate Withdrawals / Deposits columns (unused side blank),
+   Balance is a plain positive number. Anchor = a line carrying
+   BOTH a DD-MM-YYYY date and a balance — no keyword list needed.
+   ============================================================ */
+function canara_col(xc){
+  if (xc < 80)  return "date";   // right-aligned amounts: dr→x1≈418,
+  if (xc < 352) return "part";   // cr→x1≈494, bal→x1≈573 — well separated
+  if (xc < 435) return "withdrawal";
+  if (xc < 510) return "deposit";
+  return "balance";
+}
+const CANARA_DATE = /^\d{2}-\d{2}-\d{4}$/;
+const CANARA_AMT  = /^[\d,]+\.\d{2}$/;
+
+async function parseCanara(arrayBuffer, onProgress){
+  const pdf = await pdfjsLib.getDocument({ data: arrayBuffer }).promise;
+  const out = [];
+  let account = null, cur = null;
+
+  for (let p = 1; p <= pdf.numPages; p++){
+    const page = await pdf.getPage(p);
+    const H = page.getViewport({ scale: 1 }).height;
+    const tc = await page.getTextContent();
+    const items = [];
+    for (const it of tc.items){
+      const s = (it.str || "").trim();
+      if (!s) continue;
+      const x = it.transform[4], w = it.width || 0, top = H - it.transform[5];
+      items.push({ t:s, x0:x, x1:x+w, xc:x + w/2, top });
+    }
+    if (p === 1) account = canara_account(items);
+
+    const lines = clusterLines(items);
+    for (const line of lines){
+      const b = {};
+      for (const c of line.cells.slice().sort((p,q)=>p.xc-q.xc)) (b[canara_col(c.xc)] = b[canara_col(c.xc)] || []).push(c.t);
+      const date = (b.date || []).join(""), bal = (b.balance || []).join("");
+      if (CANARA_DATE.test(date) && CANARA_AMT.test(bal)){
+        if (cur) out.push(cur);
+        cur = { date, particulars: (b.part || []).slice(),
+                withdrawal: toNum((b.withdrawal || []).join("")),
+                deposit:    toNum((b.deposit    || []).join("")),
+                balance:    toNum(bal) };
+      } else if (cur && b.part){
+        cur.particulars = cur.particulars.concat(b.part);   // wrapped description
+      }
+    }
+    if (onProgress) onProgress(p, pdf.numPages);
+  }
+  if (cur) out.push(cur);
+
+  const rows = out.map(t => ({
+    date: t.date,
+    particulars: t.particulars.join(" ").replace(/\s+/g," ").trim(),
+    withdrawal: t.withdrawal, deposit: t.deposit, balance: t.balance
+  }));
+
+  const A = account || {};
+  return {
+    period: A.period || "",
+    account: [
+      { label:"Account Name", value:A.name||"" },     { label:"Account Number", value:A.number||"" },
+      { label:"Customer ID", value:A.custId||"" },     { label:"Branch", value:A.branch||"" },
+      { label:"Branch Code", value:A.branchCode||"" }, { label:"IFSC Code", value:A.ifsc||"" },
+      { label:"Phone", value:A.phone||"" },            { label:"Statement Period", value:A.period||"" },
+      { label:"Total Transactions", value:String(rows.length) }
+    ],
+    columns: [
+      { key:"date", label:"Date", type:"center", width:13 },
+      { key:"particulars", label:"Particulars", type:"text", width:62 },
+      { key:"withdrawal", label:"Withdrawals", type:"dr", width:17 },
+      { key:"deposit", label:"Deposits", type:"cr", width:17 },
+      { key:"balance", label:"Balance", type:"bal", width:18 }
+    ],
+    rows
+  };
+}
+function canara_account(items){
+  const top = items.filter(i => i.top < 260);
+  const lines = clusterLines(top);
+  const text = lines.map(line => {
+    const cs = line.cells.slice().sort((a,b)=>a.x0-b.x0);
+    let out = [], cell = "", prevX1 = null;
+    for (const c of cs){
+      if (prevX1 !== null && (c.x0 - prevX1) > 8){ out.push(cell); cell = c.t; }
+      else cell = cell ? cell + " " + c.t : c.t;
+      prevX1 = c.x1;
+    }
+    if (cell) out.push(cell);
+    return out.join("\t");
+  }).join("\n");
+  const grab = re => { const m = text.match(re); return m ? m[1].trim() : ""; };
+  const number = grab(/A\/c\s+(\d+)\s+Between/i);
+  const from   = grab(/Between\s+([0-9A-Za-z-]+)\s+and/i);
+  const to     = grab(/\band\s+([0-9A-Za-z-]+)/i);
+  return {
+    number,
+    name:       grab(/(?:^|\n)Name\t+([^\t\n]+)/i),
+    custId:     grab(/(?:^|\n)Client\t+([^\t\n]+)/i),
+    branch:     grab(/Branch\s*Name\t+([^\t\n]+)/i),
+    branchCode: grab(/Branch\s*Code\t+([0-9]+)/i),
+    ifsc:       grab(/IFSC\s*Code\t+([A-Z0-9]+)/i),
+    phone:      grab(/(?:^|\n)Phone\t+([0-9]+)/i),
+    period: (from && to) ? `${from} – ${to}` : (from || to || "")
+  };
+}
+
+/* ============================================================
+   EXCEL BUILDER  (schema-driven; single sheet)
+   ============================================================ */
+async function buildExcel(bank, parsed){
+  const { account, columns, rows } = parsed;
+  const wb = new ExcelJS.Workbook();
+  const nCols = columns.length;
+  const infoRows = Math.ceil(account.length / 2);
+  const sepRow = 3 + infoRows;
+  const hdrRow = sepRow + 1;
+  const ws = wb.addWorksheet("Statement", { views:[{ state:"frozen", ySplit: hdrRow }] });
+
+  const NAVY="FF14233A", WHITE="FFFFFFFF", LINE="FFD7DEE7", STRIPE="FFF7F9FB",
+        RED="FFB42318", GREEN="FF0B6E5B", LABEL="FF0B6E5B";
+  const thin = { style:"thin", color:{argb:LINE} };
+  const border = { top:thin,left:thin,bottom:thin,right:thin };
+  columns.forEach((c,i)=> ws.getColumn(i+1).width = c.width);
+
+  // Title
+  ws.mergeCells(1,1,1,nCols);
+  const t = ws.getCell(1,1);
+  t.value = `${bank.name} — Account Statement`;
+  t.font = { name:"Arial", bold:true, size:14, color:{argb:NAVY} };
+  ws.getRow(1).height = 22;
+
+  // Account info — two label/value pairs per row, spread across the width
+  const half = Math.ceil(nCols/2);
+  for (let i = 0; i < infoRows; i++){
+    const row = 3 + i;
+    const a = account[i*2], b = account[i*2+1];
+    if (a){
+      ws.getCell(row,1).value = a.label + ":"; ws.getCell(row,1).font = { name:"Arial", bold:true, size:11, color:{argb:LABEL} };
+      ws.mergeCells(row,2,row,half); ws.getCell(row,2).value = a.value; ws.getCell(row,2).font = { name:"Arial", size:11, color:{argb:NAVY} };
+    }
+    if (b){
+      ws.getCell(row,half+1).value = b.label + ":"; ws.getCell(row,half+1).font = { name:"Arial", bold:true, size:11, color:{argb:LABEL} };
+      ws.mergeCells(row,half+2,row,nCols); ws.getCell(row,half+2).value = b.value; ws.getCell(row,half+2).font = { name:"Arial", size:11, color:{argb:NAVY} };
+    }
+  }
+  for (let c=1;c<=nCols;c++) ws.getCell(sepRow,c).fill = { type:"pattern", pattern:"solid", fgColor:{argb:NAVY} };
+  ws.getRow(sepRow).height = 5;
+
+  // Header
+  const hr = ws.getRow(hdrRow);
+  columns.forEach((col,i)=>{
+    const c = hr.getCell(i+1);
+    c.value = col.label;
+    c.font = { name:"Arial", bold:true, size:10, color:{argb:WHITE} };
+    c.fill = { type:"pattern", pattern:"solid", fgColor:{argb:NAVY} };
+    c.alignment = { horizontal:"center", vertical:"middle", wrapText:true };
+    c.border = border;
+  });
+  hr.height = 26;
+
+  // Data
+  const numFmt = "#,##0.00", balFmt = "#,##0.00;-#,##0.00";
+  rows.forEach((rec, idx) => {
+    const r = hdrRow + 1 + idx;
+    const fill = (idx % 2 === 0) ? { type:"pattern", pattern:"solid", fgColor:{argb:STRIPE} } : undefined;
+    columns.forEach((col, ci) => {
+      const cell = ws.getCell(r, ci+1);
+      const v = rec[col.key];
+      let font = { name:"Arial", size:10, color:{argb:NAVY} };
+      let align = { vertical:"middle" };
+      if (col.type === "center" || col.type === "mono") align = { horizontal:"center", vertical:"middle" };
+      else if (col.type === "text") align = { horizontal:"left", vertical:"middle", wrapText:true };
+      else if (col.type === "dr"){ font = { name:"Arial", size:10, color:{argb:RED} };   align = { horizontal:"right", vertical:"middle" }; }
+      else if (col.type === "cr"){ font = { name:"Arial", size:10, color:{argb:GREEN} }; align = { horizontal:"right", vertical:"middle" }; }
+      else if (col.type === "bal"){ const r = (typeof v === "number" && v < 0); font = { name:"Arial", size:10, color:{argb: r?RED:NAVY} }; align = { horizontal:"right", vertical:"middle" }; }
+      if (v !== null && v !== undefined && v !== "") cell.value = v;
+      if (col.type === "dr" || col.type === "cr") cell.numFmt = numFmt;
+      if (col.type === "bal") cell.numFmt = balFmt;
+      cell.font = font; cell.alignment = align; cell.border = border;
+      if (fill) cell.fill = fill;
+    });
+  });
+
+  // Totals (sum every dr / cr column)
+  const last = hdrRow + rows.length;
+  const sr = last + 2;
+  const firstNum = columns.findIndex(c => c.type === "dr" || c.type === "cr");
+  if (firstNum > 0){
+    ws.getCell(sr, firstNum).value = "TOTAL";
+    ws.getCell(sr, firstNum).font = { name:"Arial", bold:true, size:11, color:{argb:NAVY} };
+    ws.getCell(sr, firstNum).alignment = { horizontal:"right" };
+  }
+  columns.forEach((col, ci) => {
+    if (col.type === "dr" || col.type === "cr"){
+      const L = ws.getColumn(ci+1).letter;
+      const cell = ws.getCell(sr, ci+1);
+      cell.value = { formula:`SUM(${L}${hdrRow+1}:${L}${last})` };
+      cell.font = { name:"Arial", bold:true, size:11, color:{argb: col.type==="dr"?RED:GREEN } };
+      cell.numFmt = numFmt; cell.alignment = { horizontal:"right" };
+    }
+  });
+
+  ws.autoFilter = { from:{row:hdrRow,column:1}, to:{row:last,column:nCols} };
+  const buf = await wb.xlsx.writeBuffer();
+  return new Blob([buf], { type:"application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" });
+}
+
+/* ============================================================
+   UI
+   ============================================================ */
+const $ = id => document.getElementById(id);
+let lastBlob = null, lastName = "statement.xlsx", lastParsed = null, pvRows = [];
+
+function renderGrid(){
+  const g = $("grid");
+  BANKS.forEach(b => {
+    const ready = !!b.parser;
+    const el = document.createElement("button");
+    el.className = "cell " + (ready ? "ready" : "soon");
+    el.disabled = !ready; el.dataset.id = b.id;
+    el.innerHTML =
+      `<div class="code"><span class="swatch" style="background:${b.color}"></span><span class="abbr">${b.abbr}</span></div>` +
+      `<div class="name">${b.name}</div>` +
+      `<div class="state">${ready ? "Available" : "Soon"}</div><span class="arrow">→</span>`;
+    if (ready) el.addEventListener("click", () => selectBank(b.id));
+    g.appendChild(el);
+  });
+}
+function selectBank(id){
+  selected = REGISTRY[id];
+  document.querySelectorAll(".cell").forEach(c => c.classList.toggle("active", c.dataset.id === id));
+  $("step2").style.opacity = "1";
+  $("phSwatch").style.background = selected.color;
+  $("phTitle").textContent = selected.name;
+  $("phSub").textContent = "Drop a statement PDF and download a formatted .xlsx";
+  resetPanel();
+  $("panel").classList.add("show");
+  $("panel").scrollIntoView({ behavior:"smooth", block:"nearest" });
+}
+function resetPanel(){
+  $("drop").style.display = "block";
+  $("work").classList.remove("show");
+  $("result").classList.remove("show");
+  $("err").classList.remove("show");
+  $("file").value = "";
+  $("barFill").style.width = "0%";
+  $("preview").classList.remove("show");
+  $("pvSearch").value = ""; $("pvBody").innerHTML = "";
+  lastBlob = null;
+}
+function showError(msg){
+  $("work").classList.remove("show");
+  $("err").innerHTML = `<b>Couldn't convert this file.</b> ${msg}`;
+  $("err").classList.add("show");
+  $("drop").style.display = "block";
+}
+function fmt(n){ return (n||0).toLocaleString("en-IN",{ minimumFractionDigits:2, maximumFractionDigits:2 }); }
+function escapeHtml(s){ return String(s == null ? "" : s).replace(/[&<>"]/g, c => ({ "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;" }[c])); }
+
+function sumByType(parsed, type){
+  const keys = parsed.columns.filter(c => c.type === type).map(c => c.key);
+  return parsed.rows.reduce((s,r) => s + keys.reduce((a,k)=> a + (r[k]||0), 0), 0);
+}
+
+function renderPreview(parsed){
+  const cols = parsed.columns;
+  $("pvHead").innerHTML = "<tr>" + cols.map(c =>
+    `<th class="${(c.type==='dr'||c.type==='cr'||c.type==='bal')?'r':''}">${escapeHtml(c.label)}</th>`).join("") + "</tr>";
+
+  pvRows = parsed.rows.map(rec => {
+    const tds = cols.map(c => {
+      const v = rec[c.key];
+      if (c.type === "dr") return v==null ? `<td class="num empty">—</td>` : `<td class="num dr">${fmt(v)}</td>`;
+      if (c.type === "cr") return v==null ? `<td class="num empty">—</td>` : `<td class="num cr">${fmt(v)}</td>`;
+      if (c.type === "bal"){
+        if (v==null) return `<td class="num empty">—</td>`;
+        const neg = v < 0;
+        return `<td class="num ${neg?'dr':''}">${neg?'-':''}${fmt(Math.abs(v))}</td>`;
+      }
+      if (c.type === "text") return `<td class="desc">${escapeHtml(v)}</td>`;
+      if (c.type === "mono") return `<td class="c mono">${escapeHtml(v)}</td>`;
+      return `<td class="c">${escapeHtml(v==null?"":v)}</td>`;
+    }).join("");
+    const hay = cols.map(c => rec[c.key]==null ? "" : rec[c.key]).join(" ").toLowerCase();
+    return { hay, html:`<tr>${tds}</tr>` };
+  });
+
+  paintRows(pvRows);
+  $("preview").classList.add("show");
+}
+function paintRows(list){
+  const span = (lastParsed ? lastParsed.columns.length : 8);
+  $("pvBody").innerHTML = list.length ? list.map(r => r.html).join("")
+    : `<tr><td colspan="${span}" class="none">No rows match that filter.</td></tr>`;
+  const total = pvRows.length.toLocaleString("en-IN");
+  $("pvCount").textContent = list.length === pvRows.length ? `${total} transactions`
+    : `${list.length.toLocaleString("en-IN")} of ${total}`;
+}
+
+async function handleFile(file){
+  if (!file) return;
+  if (file.type !== "application/pdf" && !file.name.toLowerCase().endsWith(".pdf")){ showError("Please choose a PDF file."); return; }
+  if (!librariesLoaded()){ showError("The PDF/Excel engines didn't load (they come from a CDN). Check your connection, or if you opened this file from disk, serve it over http — see the note below."); return; }
+  $("err").classList.remove("show");
+  $("drop").style.display = "none";
+  $("result").classList.remove("show");
+  $("work").classList.add("show");
+  $("workLbl").textContent = "Starting…";
+  $("barFill").style.width = "4%";
+
+  try {
+    await ensureWorker();
+    const buf = await file.arrayBuffer();
+    const parsed = await withTimeout(
+      selected.parser(buf, (p, total) => {
+        const pct = Math.round((p/total)*88) + 6;
+        $("barFill").style.width = pct + "%";
+        $("workLbl").innerHTML = `Scanning page <span class="mono">${p}</span> of <span class="mono">${total}</span>…`;
+      }),
+      60000,
+      "Timed out while reading the PDF. If you opened this file directly from disk (file://), the browser is blocking the PDF worker — serve it over http or deploy it (see the note below)."
+    );
+
+    if (!parsed.rows.length){
+      showError("No transactions were found — this may be a different statement layout for this bank. Send me a sample and I'll extend the parser."); return;
+    }
+
+    $("workLbl").textContent = "Building Excel…";
+    $("barFill").style.width = "96%";
+    lastParsed = parsed;
+    lastBlob = await buildExcel(selected, parsed);
+    $("barFill").style.width = "100%";
+
+    const dr = sumByType(parsed, "dr"), cr = sumByType(parsed, "cr");
+    const drCol = parsed.columns.find(c => c.type === "dr");
+    const crCol = parsed.columns.find(c => c.type === "cr");
+    $("mCount").textContent = parsed.rows.length.toLocaleString("en-IN");
+    $("mPeriod").textContent = parsed.period || "—";
+    $("mDr").textContent = "₹" + fmt(dr);
+    $("mCr").textContent = "₹" + fmt(cr);
+    $("mDrL").textContent = "Total " + (drCol ? drCol.label.replace(/\s*\(.*\)/,"").toLowerCase() : "out");
+    $("mCrL").textContent = "Total " + (crCol ? crCol.label.replace(/\s*\(.*\)/,"").toLowerCase() : "in");
+
+    const acctPairs = parsed.account
+      .filter(a => a.value && !/^total/i.test(a.label))
+      .slice(0,4)
+      .map(a => `${escapeHtml(a.label)}: <b>${escapeHtml(a.value)}</b>`);
+    $("acct").innerHTML = `<div class="row">${acctPairs.join(" · ")}</div>`;
+
+    renderPreview(parsed);
+
+    const safe = (parsed.period||"statement").replace(/[^\w]+/g,"_").replace(/^_+|_+$/g,"");
+    lastName = `${selected.abbr}_Statement_${safe}.xlsx`;
+
+    setTimeout(()=>{ $("work").classList.remove("show"); $("result").classList.add("show"); }, 250);
+  } catch (e){
+    console.error(e);
+    const detail = (e && e.message) ? e.message : "Unknown error.";
+    showError(`<span class="mono">${escapeHtml(detail)}</span> — if you opened this file directly from disk, serve it over http or deploy it (see the note below).`);
+  }
+}
+
+function download(){
+  if (!lastBlob) return;
+  const url = URL.createObjectURL(lastBlob);
+  const a = document.createElement("a"); a.href = url; a.download = lastName; a.click();
+  URL.revokeObjectURL(url);
+}
+
+renderGrid();
+if (!librariesLoaded()){
+  const note = document.createElement("div");
+  note.className = "err show"; note.style.margin = "14px 0 0";
+  note.innerHTML = "<b>Engines failed to load.</b> The PDF and Excel libraries are served from a CDN — check your connection. If you opened this HTML file directly (file://), some browsers block them; serve it over http instead (see the note below).";
+  $("grid").parentNode.insertBefore(note, $("grid").nextSibling);
+}
+$("drop").addEventListener("click", ()=> $("file").click());
+$("file").addEventListener("change", e => handleFile(e.target.files[0]));
+["dragenter","dragover"].forEach(ev => $("drop").addEventListener(ev, e=>{ e.preventDefault(); $("drop").classList.add("over"); }));
+["dragleave","drop"].forEach(ev => $("drop").addEventListener(ev, e=>{ e.preventDefault(); $("drop").classList.remove("over"); }));
+$("drop").addEventListener("drop", e => handleFile(e.dataTransfer.files[0]));
+$("dl").addEventListener("click", download);
+$("again").addEventListener("click", resetPanel);
+$("pvSearch").addEventListener("input", e => {
+  const q = e.target.value.trim().toLowerCase();
+  paintRows(q ? pvRows.filter(r => r.hay.indexOf(q) !== -1) : pvRows);
+});
+</script>
+</body>
+</html>
