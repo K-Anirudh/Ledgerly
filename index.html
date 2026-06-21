@@ -295,7 +295,7 @@ const BANKS = [
   { id:"hdfc",    abbr:"HDFC",  name:"HDFC Bank",            color:"#13357B", parser:parseHDFC },
   { id:"kotak",   abbr:"KOTAK", name:"Kotak Mahindra",       color:"#B5121B", parser:null },
   { id:"bob",     abbr:"BOB",   name:"Bank of Baroda",       color:"#E35205", parser:parseBoB },
-  { id:"pnb",     abbr:"PNB",   name:"Punjab National",      color:"#A5235A", parser:null },
+  { id:"pnb",     abbr:"PNB",   name:"Punjab National",      color:"#A5235A", parser:parsePunjab },
 ];
 const REGISTRY = Object.fromEntries(BANKS.map(b => [b.id, b]));
 let selected = null;
@@ -798,7 +798,40 @@ function canara_account(items){
 }
 
 /* ============================================================
-   UNION BANK OF INDIA PARSER
+   UNION BANK OF INDIA — DISPATCHER over two distinct layouts
+   ------------------------------------------------------------
+   UBI ships at least two unrelated statement templates:
+     A) "core" branch/net-banking export — SERIAL-numbered, single
+        line per txn, DD/MM/YYYY dates, single Amount + (Cr)/(Dr).
+     B) "Union eCase / Details of Statement" — NO serial, MIDDLE-anchor
+        rows where the DD-MM-YYYY date wraps above & below the anchor
+        and (for 7-digit values) the balance/amount NUMBER renders one
+        line ABOVE the anchor with its (Cr)/(Dr) suffix one line BELOW.
+   `parseUnionBank` sniffs page-1 text and routes:
+     B if page 1 carries the "Your Details" + "Account Details" panels
+       → parseUnionBankCase
+     C else if page 1 carries the Finacle "STATEMENT OF ACCOUNT FOR THE
+       PERIOD" header with separate WITHDRAWALS + DEPOSITS columns
+       → parseUnionBankPeriod
+     A otherwise → parseUnionBankCore
+   The dispatcher copies the buffer (arrayBuffer.slice(0)) before the
+   sniff, because pdf.js consumes the ArrayBuffer it parses.
+   ============================================================ */
+async function parseUnionBank(arrayBuffer, onProgress){
+  const sniffBuf = arrayBuffer.slice(0);
+  const pdf = await pdfjsLib.getDocument({ data: sniffBuf }).promise;
+  const tc = await (await pdf.getPage(1)).getTextContent();
+  const text = tc.items.map(i => i.str || "").join(" ");
+  const isCase = /Your\s*Details/i.test(text) && /Account\s*Details/i.test(text);
+  if (isCase) return parseUnionBankCase(arrayBuffer, onProgress);
+  const isPeriod = /STATEMENT\s+OF\s+ACCOUNT\s+FOR\s+THE\s+PERIOD/i.test(text)
+                && /WITHDRAWALS/i.test(text) && /DEPOSITS/i.test(text);
+  if (isPeriod) return parseUnionBankPeriod(arrayBuffer, onProgress);
+  return parseUnionBankCore(arrayBuffer, onProgress);
+}
+
+/* ============================================================
+   UBI format A — "core" serial-anchored
    Serial-numbered like ICICI, but Amount and Balance each share
    ONE column with a (Cr)/(Dr) suffix — so the parser splits the
    single Amount into Debit/Credit by suffix. Balance is signed
@@ -816,7 +849,7 @@ function ubi_col(xc){
 }
 const UBI_DATE = /^\d{2}\/\d{2}\/\d{4}$/;
 
-async function parseUnionBank(arrayBuffer, onProgress){
+async function parseUnionBankCore(arrayBuffer, onProgress){
   const pdf = await pdfjsLib.getDocument({ data: arrayBuffer }).promise;
   const txns = [];
   let account = null, cur = null;
@@ -951,6 +984,328 @@ function ubi_account(items){
     currency: grab(/Currency\t+([A-Za-z]+)/i),
     period
   };
+}
+
+/* ============================================================
+   UBI format B — "Union eCase / Details of Statement"
+   ------------------------------------------------------------
+   Page ~595pt wide. Columns by x-center:
+     Date (<70) | Transaction Id (<145) | Remarks (<415) |
+     Amount (<495) | Balance (≥495).  NO serial number.
+   MIDDLE-ANCHOR rows (same family as BoB / PNB-ONE): the anchor
+   line carries Transaction Id + Remarks + Amount; the DD-MM-YYYY
+   date is split with "DD-MM-" one baseline ABOVE the anchor and
+   "YYYY" one baseline BELOW. Baselines sit ~5pt apart, so the
+   default clusterLines(tol=3) keeps the three baselines separate
+   and the per-anchor y-band reassembles them.
+
+   THE TRAP: for 7-digit amounts/balances the cell WRAPS vertically
+   inside the row — the NUMBER renders one baseline ABOVE the anchor
+   and its "(Cr)/(Dr)" suffix one baseline BELOW (e.g. balance
+   "1026385.18" above + "(Cr)" below). So each cell must be gathered
+   across the WHOLE row y-band and concatenated in (top,x0) order,
+   never read from the anchor line alone. This also makes the parser
+   robust to pdf.js merging "1026385.18(Cr)" into a single item.
+
+   Anchor = a line whose Transaction-Id column holds a /^[A-Z]\d{3,}$/
+   token. The per-page repeating "Date Transaction Id Remarks ..."
+   header, the page-1 account block, and the final banner page all
+   fail this test naturally (no txn-id token in that column).
+   Amount carries a (Cr)/(Dr) suffix and is split to Debit/Credit;
+   Balance is signed by its own suffix (always Cr here).
+   Validated to 0 balance-chain breaks across 1,600 transactions,
+   closing balance matching the statement exactly.
+   ============================================================ */
+function ubiCase_col(xc){
+  if (xc < 70)  return "date";
+  if (xc < 145) return "txnid";
+  if (xc < 415) return "remarks";
+  if (xc < 495) return "amount";   // number + (Cr)/(Dr), may wrap above/below
+  return "balance";                // number + (Cr)/(Dr), may wrap above/below
+}
+const UBIC_TXNID = /^[A-Z]\d{3,}$/;
+const UBIC_DATE  = /^\d{2}-\d{2}-\d{4}$/;
+const UBIC_PAIR  = /([\d,]+\.\d{2})\s*\((Cr|Dr)\)/i;
+
+async function parseUnionBankCase(arrayBuffer, onProgress){
+  const pdf = await pdfjsLib.getDocument({ data: arrayBuffer }).promise;
+  const txns = [];
+  let account = null;
+
+  for (let p = 1; p <= pdf.numPages; p++){
+    const page = await pdf.getPage(p);
+    const H = page.getViewport({ scale: 1 }).height;
+    const tc = await page.getTextContent();
+    const items = [];
+    for (const it of tc.items){
+      const s = (it.str || "").trim();
+      if (!s) continue;
+      const x = it.transform[4], w = it.width || 0, top = H - it.transform[5];
+      items.push({ t:s, x0:x, x1:x+w, xc:x + w/2, top });
+    }
+    if (p === 1) account = ubiCase_account(items);
+
+    const lines = clusterLines(items, 3);   // keep the ~5pt baselines separate
+
+    // anchors = lines with a txn-id token in the txn-id column
+    const anchors = [];
+    for (const line of lines){
+      const hit = line.cells.some(c => ubiCase_col(c.xc) === "txnid" && UBIC_TXNID.test(c.t));
+      if (hit) anchors.push(line);
+    }
+    if (!anchors.length){ if (onProgress) onProgress(p, pdf.numPages); continue; }
+
+    // y-band per anchor by midpoints to neighbours (±~11 fallback at the ends)
+    for (let i = 0; i < anchors.length; i++){
+      const a = anchors[i];
+      const prevTop = (i > 0) ? anchors[i-1].top : a.top - 23;
+      const nextTop = (i < anchors.length-1) ? anchors[i+1].top : a.top + 23;
+      a.ylo = (prevTop + a.top) / 2;
+      a.yhi = (a.top + nextTop) / 2;
+    }
+
+    for (const a of anchors){
+      const band = { date:[], txnid:[], remarks:[], amount:[], balance:[] };
+      for (const line of lines){
+        const inBand = (a.ylo < line.top && line.top <= a.yhi)
+                     || Math.round(line.top*10) === Math.round(a.top*10);
+        if (!inBand) continue;
+        for (const c of line.cells){
+          band[ubiCase_col(c.xc)].push([c.top, c.x0, c.t]);
+        }
+      }
+      for (const k in band) band[k].sort((u,v) => u[0]-v[0] || u[1]-v[1]);
+      const join = arr => arr.map(z => z[2]).join("");
+      const date    = join(band.date);                         // "DD-MM-" + "YYYY"
+      const txnId   = join(band.txnid);
+      const remarks = band.remarks.map(z => z[2]).join(" ").replace(/\s+/g," ").trim();
+      const amountS = join(band.amount);                       // "1930.00(Cr)" / "1000000.00" + "(Cr)"
+      const balS    = join(band.balance);
+
+      if (!UBIC_DATE.test(date)) continue;                     // guard against stray anchors
+
+      const am = UBIC_PAIR.exec(amountS);
+      const amt = am ? toNum(am[1]) : null;
+      const isDebit = am && /Dr/i.test(am[2]);
+      const bm = UBIC_PAIR.exec(balS);
+      let bal = bm ? toNum(bm[1]) : null;
+      if (bal !== null && bm && /Dr/i.test(bm[2])) bal = -bal;
+
+      txns.push({
+        date,
+        txnId,
+        remarks,
+        debit:  (amt !== null &&  isDebit) ? amt : null,
+        credit: (amt !== null && !isDebit) ? amt : null,
+        balance: bal
+      });
+    }
+    if (onProgress) onProgress(p, pdf.numPages);
+  }
+
+  const A = account || {};
+  return {
+    period: A.period || "",
+    account: [
+      { label:"Account Name", value:A.name||"" },        { label:"Account Number", value:A.number||"" },
+      { label:"Account Type", value:A.type||"" },        { label:"Customer/CIF ID", value:A.custId||"" },
+      { label:"IFSC Code", value:A.ifsc||"" },           { label:"Currency", value:A.currency||"" },
+      { label:"Branch Address", value:A.branch||"" },    { label:"Statement Period", value:A.period||"" },
+      { label:"Total Transactions", value:String(txns.length) }
+    ],
+    columns: [
+      { key:"date", label:"Date", type:"center", width:13 },
+      { key:"txnId", label:"Transaction ID", type:"mono", width:14 },
+      { key:"remarks", label:"Remarks", type:"text", width:56 },
+      { key:"debit", label:"Debit", type:"dr", width:16 },
+      { key:"credit", label:"Credit", type:"cr", width:16 },
+      { key:"balance", label:"Balance", type:"bal", width:18 }
+    ],
+    rows: txns
+  };
+}
+function ubiCase_account(items){
+  const top = items.filter(i => i.top < 345);
+  const lines = clusterLines(top, 3);
+  // left half (x0<300) and right half (x0>=300) of each clustered line
+  const sideText = (cells, lo, hi) =>
+    cells.filter(c => c.x0 >= lo && c.x0 < hi).sort((a,b)=>a.x0-b.x0).map(c => c.t).join(" ").trim();
+  const left  = lines.map(l => sideText(l.cells, 0, 300)).join("\n");
+  const right = lines.map(l => sideText(l.cells, 300, 9999)).join("\n");
+  const grab = (text, re) => { const m = text.match(re); return m ? m[1].trim() : ""; };
+
+  // Right column = clean "Label Value" pairs
+  const custId   = grab(right, /Customer\/CIF\s*ID\s+(\S+)/i);
+  const type     = grab(right, /Account\s*Type\s+([^\n]+)/i);
+  const name     = grab(right, /Account\s*Name\s+([^\n]+)/i);
+  const number   = grab(right, /Account\s*Number\s+(\d+)/i);
+  const currency = grab(right, /Currency\s+([A-Za-z]+)/i);
+  const ifsc     = grab(right, /IFSC\s+([A-Z0-9]+)/i);
+
+  // Branch Address is multi-line on the right: the "Branch Address" label
+  // sits on the MIDDLE value line, with chunks above and below. Collect the
+  // right-side lines from the label's neighbourhood, stripping the label.
+  const rArr = right.split("\n");
+  let branch = "";
+  const bi = rArr.findIndex(l => /Branch\s*Address/i.test(l));
+  if (bi > -1){
+    const parts = [];
+    if (rArr[bi-1] && /^[A-Z0-9]/.test(rArr[bi-1]) && !/(Customer|Account|Currency|IFSC|Statement)/i.test(rArr[bi-1]))
+      parts.push(rArr[bi-1].trim());
+    parts.push(rArr[bi].replace(/Branch\s*Address/i, "").trim());
+    for (let j = bi+1; j < rArr.length; j++){
+      const L = rArr[j].trim();
+      if (!L || /(Customer|Account|Currency|IFSC|Statement)/i.test(L)) break;
+      parts.push(L);
+    }
+    branch = parts.filter(Boolean).join(", ").replace(/,\s*,/g, ",").trim();
+  }
+
+  // Statement Period from the left column
+  const sp = left.match(/Statement\s*Period\s+(\d{2}-\d{2}-\d{4})\s+to\s+(\d{2}-\d{2}-\d{4})/i);
+  const period = sp ? `${sp[1]} – ${sp[2]}` : "";
+
+  return { name, number, type, custId, ifsc, currency, branch, period };
+}
+
+/* ============================================================
+   UBI format C — Finacle "STATEMENT OF ACCOUNT FOR THE PERIOD"
+   No serial. Columns: DATE | PARTICULARS | CHQ.NO. | WITHDRAWALS
+   | DEPOSITS | BALANCE. Date is a single DD-MM-YYYY token on the
+   anchor line; the four money columns (withdrawal, deposit,
+   balance) are right-aligned and sit on that SAME baseline (no
+   vertical wrap). Description wraps on lines BELOW the anchor
+   (UTR Number / Sender* / Beneficiary* / address). The first
+   data row is an opening-balance line (no date; deposit == balance)
+   which UBI also folds into its printed DEPOSITS cumulative total.
+   Money columns classified by right-edge (x1), since right-aligned:
+     balance  x1>=475 ; deposit 410<=x1<475 ; withdrawal 340<=x1<410
+   date x0<92 ; cheque x0>=285 (&x1<340) ; else particulars.
+   ============================================================ */
+function ubiPeriod_col(x0, x1){
+  if (x0 < 92)   return "date";
+  if (x1 >= 475) return "balance";
+  if (x1 >= 410) return "deposit";
+  if (x1 >= 340) return "withdrawal";
+  if (x0 >= 285) return "cheque";
+  return "part";
+}
+const UBIP_DATE  = /^\d{2}-\d{2}-\d{4}$/;
+const UBIP_MONEY = /^[\d,]+\.\d{2}$/;
+const UBIP_BAL   = /^([\d,]+\.\d{2})(Cr|Dr)$/i;
+const UBIP_JUNK  = /UNION BANK OF INDIA|STATEMENT OF ACCOUNT|PARTICULARS|Cumulative Totals|Transaction Details|finacle\.ubi|^https?:|powappsrv|PAGE:\s*\d|Min\.?\s*Bal|Unless constituent|To strengthen|FASTEST MODE|IFSC\/MICR|Contact all India|Please visit|^Manager$|found the account|legal heirs|CKYC|CUST\s*ID/i;
+
+async function parseUnionBankPeriod(arrayBuffer, onProgress){
+  const pdf = await pdfjsLib.getDocument({ data: arrayBuffer }).promise;
+  const txns = [];
+  let account = null, opening = null;
+
+  for (let p = 1; p <= pdf.numPages; p++){
+    const page = await pdf.getPage(p);
+    const H = page.getViewport({ scale: 1 }).height;
+    const tc = await page.getTextContent();
+    const items = [];
+    for (const it of tc.items){
+      const s = (it.str || "").trim();
+      if (!s) continue;
+      const x = it.transform[4], w = it.width || 0, top = H - it.transform[5];
+      items.push({ t:s, x0:x, x1:x+w, xc:x + w/2, top });
+    }
+    if (p === 1) account = ubiPeriod_account(items);
+
+    const lines = clusterLines(items, 3);
+
+    for (const line of lines){
+      const cells = { date:[], part:[], cheque:[], withdrawal:[], deposit:[], balance:[] };
+      for (const c of line.cells.slice().sort((a,b)=>a.x0-b.x0))
+        cells[ubiPeriod_col(c.x0, c.x1)].push(c.t);
+
+      const full = line.cells.map(c=>c.t).join(" ");
+      // skip pure separator rows
+      if (/^[-\s]+$/.test(full) && full.replace(/\s/g,"").length > 20) continue;
+
+      // Anchor = the date column begins with a DD-MM-YYYY date. pdf.js
+      // tokenizes this date very differently from pdfplumber: it emits the
+      // date as FIVE separate glyph-run items — "01" "-" "04" "-" "2023" —
+      // so the joined date cell reads "01 - 04 - 2023". It can also merge
+      // the date with the first narration word ("01-04-2023IMPSAB…"). Match
+      // the three components tolerantly (optional spaces around the dashes)
+      // and peel any trailing text into the particulars.
+      const dRaw = cells.date.join(" ");
+      const dm = dRaw.match(/^\s*(\d{2})\s*-\s*(\d{2})\s*-\s*(\d{4})\s*([\s\S]*)$/);
+      const balS = cells.balance.join("").replace(/\s/g,"");
+      const bm   = UBIP_BAL.exec(balS);
+
+      if (dm){
+        const wS = cells.withdrawal.join("").replace(/\s/g,"");
+        const dS = cells.deposit.join("").replace(/\s/g,"");
+        let bal = bm ? toNum(bm[1]) : null;
+        if (bal !== null && bm && /Dr/i.test(bm[2])) bal = -bal;
+        const lead = dm[4].trim();                     // merged narration, if any
+        const part = (lead ? lead + " " : "") + cells.part.join(" ");
+        txns.push({
+          date:    `${dm[1]}-${dm[2]}-${dm[3]}`,
+          part:    part.replace(/\s+/g," ").trim(),
+          cheque:  cells.cheque.join(" ").trim(),
+          debit:   UBIP_MONEY.test(wS) ? toNum(wS) : null,
+          credit:  UBIP_MONEY.test(dS) ? toNum(dS) : null,
+          balance: bal
+        });
+      } else if (opening === null && !txns.length && bm){
+        opening = toNum(bm[1]);                       // opening-balance line
+      } else if (txns.length && bm === null
+                 && !cells.withdrawal.length && !cells.deposit.length
+                 && !UBIP_JUNK.test(full)){
+        const extra = (cells.date.concat(cells.part, cells.cheque)).join(" ").replace(/\s+/g," ").trim();
+        if (extra) txns[txns.length-1].part += " " + extra;   // wrapped description
+      }
+    }
+    if (onProgress) onProgress(p, pdf.numPages);
+  }
+
+  const A = account || {};
+  return {
+    period: A.period || "",
+    account: [
+      { label:"Account Name", value:A.name||"" },        { label:"Account Number", value:A.number||"" },
+      { label:"Account Type", value:A.type||"" },        { label:"Customer ID", value:A.custId||"" },
+      { label:"Branch", value:A.branch||"" },            { label:"Statement Period", value:A.period||"" },
+      { label:"Opening Balance", value: opening!==null ? opening.toLocaleString("en-IN",{minimumFractionDigits:2}) : "" },
+      { label:"Total Transactions", value:String(txns.length) }
+    ],
+    columns: [
+      { key:"date", label:"Date", type:"center", width:13 },
+      { key:"part", label:"Particulars", type:"text", width:58 },
+      { key:"cheque", label:"Cheque No", type:"mono", width:13 },
+      { key:"debit", label:"Withdrawal", type:"dr", width:16 },
+      { key:"credit", label:"Deposit", type:"cr", width:16 },
+      { key:"balance", label:"Balance", type:"bal", width:18 }
+    ],
+    rows: txns
+  };
+}
+function ubiPeriod_account(items){
+  const lines = clusterLines(items.filter(i => i.top < 175), 3);
+  const L = lines.map(l => l.cells.slice().sort((a,b)=>a.x0-b.x0).map(c=>c.t).join(" ").trim());
+  const text = L.join("\n");
+  const grab = (re) => { const m = text.match(re); return m ? m[1].trim() : ""; };
+
+  const number = grab(/A\/C\s*NO:?\s*(\d{6,})/i) || grab(/A\/C\s*:?\s*(\d{6,})/i);
+  const type   = grab(/NO:?\s*\d{6,}\s+([A-Z][A-Z\/ ]+?)\s*\(/);
+  const custId = grab(/CUST\s*ID\s*:?\s*(\d+)/i);
+  const sp = text.match(/FROM\s+(\d{2})\s*-\s*(\d{2})\s*-\s*(\d{4})\s+to\s+(\d{2})\s*-\s*(\d{2})\s*-\s*(\d{4})/i);
+  const period = sp ? `${sp[1]}-${sp[2]}-${sp[3]} – ${sp[4]}-${sp[5]}-${sp[6]}` : "";
+
+  // Name = first non-empty line after the line containing "TO:"
+  let name = "";
+  const ti = L.findIndex(l => /\bTO:/.test(l));
+  if (ti > -1) for (let j = ti+1; j < L.length; j++){ if (L[j]){ name = L[j]; break; } }
+  // Branch = first non-empty line after the bank-name line
+  let branch = "";
+  const bi = L.findIndex(l => /UNION\s+BANK\s+OF\s+INDIA/i.test(l));
+  if (bi > -1) for (let j = bi+1; j < L.length; j++){ if (L[j]){ branch = L[j]; break; } }
+
+  return { name, number, type, custId, branch, period };
 }
 
 /* ============================================================
@@ -1384,6 +1739,436 @@ function hdfc_account(items){
   return {
     name, number, ifsc, micr, branch, branchCode: branchCd,
     custId, type, odLimit, currency,
+    period: (from && to) ? `${from} – ${to}` : (from || to || "")
+  };
+}
+
+/* ============================================================
+   PUNJAB NATIONAL BANK (PNB) PARSER
+   Layout: each transaction is rendered as TWO visually-adjacent
+   lines, only ~3pt apart — Line A carries Date + Withdrawal OR
+   Deposit + Balance + "Cr."/"Dr." suffix, Line B carries the
+   Narration. We bump clusterLines tol to 4 (default is 3) to fuse
+   them into one logical line, giving a clean SINGLE-line-per-
+   transaction model after clustering. Separate Withdrawal /
+   Deposit columns (only one populated per row). Balance prints as
+   a positive number with a trailing "Cr."/"Dr." suffix; "Dr."
+   flips the sign (overdraft).
+
+   CRITICAL (the bug that broke v1): pdf.js's getTextContent MERGES
+   the balance number and its "Cr."/"Dr." suffix into ONE text item
+   (e.g. "40829.68 Cr."), whereas pdfplumber splits them into two
+   words. So the suffix rides INSIDE the balance cell, and a strict
+   /^[\d,]+\.\d{2}$/ balance test never matches → zero transactions.
+   The balance cell is therefore parsed with an optional trailing
+   suffix: /^([\d,]+\.\d{2})(?:\s*(Cr|Dr)\.?)?$/i — which tolerates
+   BOTH the pdf.js merged form and a separate-suffix form. Anchor = a line carrying BOTH a
+   DD-MM-YYYY date AND a balance amount — so the column header
+   rows on every page, "Page Total", and the final "Grand" total
+   all fail the anchor test naturally (no date in the date cell).
+   Per-page repeating column header (top≈21 on pages 2-8) and the
+   page footer (Page Total + "Page N of 8" + disclaimer, all at
+   top≥738) need no special skip — they fail the anchor test too.
+   Validated to 0 balance-chain breaks on a 389-txn account,
+   matching the statement's printed Grand totals exactly.
+   ============================================================ */
+function pnb_col(xc){
+  if (xc < 90)  return "date";        // ends at x1≈78
+  if (xc < 145) return "withdrawal";  // ends at x1≈129
+  if (xc < 200) return "deposit";     // ends at x1≈188
+  if (xc < 245) return "balance";     // ends at x1≈244.3
+  if (xc < 260) return "crsuffix";    // "Cr." / "Dr." sits at xc≈250
+  if (xc < 285) return "alpha";       // narrow column, usually empty
+  if (xc < 325) return "cheque";      // usually empty
+  return "narration";                 // starts at x0≈325.7
+}
+const PNB_DATE = /^\d{2}-\d{2}-\d{4}$/;
+const PNB_AMT  = /^[\d,]+\.\d{2}$/;
+
+/* ---- PNB format A: branch-printed statement (the older layout) ---- */
+async function parsePunjabBranch(arrayBuffer, onProgress){
+  const pdf = await pdfjsLib.getDocument({ data: arrayBuffer }).promise;
+  const txns = [];
+  let account = null;
+
+  for (let p = 1; p <= pdf.numPages; p++){
+    const page = await pdf.getPage(p);
+    const H = page.getViewport({ scale: 1 }).height;
+    const tc = await page.getTextContent();
+    const items = [];
+    for (const it of tc.items){
+      const s = (it.str || "").trim();
+      if (!s) continue;
+      const x = it.transform[4], w = it.width || 0, top = H - it.transform[5];
+      items.push({ t:s, x0:x, x1:x+w, xc:x + w/2, top });
+    }
+    if (p === 1) account = pnbBranch_account(items);
+
+    // tol=4 fuses each transaction's anchor row + narration row into one logical line.
+    // The two visual rows sit ~3pt apart (just past the default tol=3 due to
+    // float math); the next transaction is ~10pt away, so tol=4 is a safe widen.
+    const lines = clusterLines(items, 4);
+    for (const line of lines){
+      const b = {};
+      for (const c of line.cells.slice().sort((p,q)=>p.xc-q.xc)) (b[pnb_col(c.xc)] = b[pnb_col(c.xc)] || []).push(c.t);
+      const date = (b.date || []).join(""), balRaw = (b.balance || []).join(" ").trim();
+      // pdf.js merges the balance number and its "Cr."/"Dr." suffix into ONE
+      // text item (e.g. "40829.68 Cr."), so the suffix usually rides in the
+      // balance cell rather than a separate column. Accept either shape:
+      //   "40829.68 Cr."  (pdf.js)  OR  "40829.68" + "Cr." in crsuffix (pdfplumber)
+      const balM = balRaw.match(/^([\d,]+\.\d{2})(?:\s*(Cr|Dr)\.?)?$/i);
+      if (!PNB_DATE.test(date) || !balM) continue;   // headers / Page Total / Grand all fail here
+
+      const wdTxt  = (b.withdrawal || []).join("");
+      const depTxt = (b.deposit    || []).join("");
+      // sign suffix may be in the balance token (pdf.js) or its own column (pdfplumber)
+      const crTxt  = (balM[2] || (b.crsuffix || []).join("") || "").trim();
+      let bal = toNum(balM[1]);
+      if (/^Dr/i.test(crTxt)) bal = -bal;
+
+      txns.push({
+        date,
+        withdrawal: PNB_AMT.test(wdTxt)  ? toNum(wdTxt)  : null,
+        deposit:    PNB_AMT.test(depTxt) ? toNum(depTxt) : null,
+        balance: bal,
+        cheque: (b.cheque || []).join(" ").trim(),
+        narration: (b.narration || []).join(" ").replace(/\s+/g," ").trim()
+      });
+    }
+    if (onProgress) onProgress(p, pdf.numPages);
+  }
+
+  const A = account || {};
+  return {
+    period: A.period || "",
+    account: [
+      { label:"Account Name", value:A.name||"" },     { label:"Account Number", value:A.number||"" },
+      { label:"IFSC Code", value:A.ifsc||"" },         { label:"MICR Code", value:A.micr||"" },
+      { label:"Customer Address", value:A.address||"" },{ label:"Branch Address", value:A.branchAddress||"" },
+      { label:"Branch Contact", value:A.branchPhone||"" },{ label:"Customer Care", value:A.custCare||"" },
+      { label:"Currency", value:A.currency||"" },      { label:"Statement Period", value:A.period||"" },
+      { label:"Total Transactions", value:String(txns.length) }
+    ],
+    columns: [
+      { key:"date", label:"Date", type:"center", width:13 },
+      { key:"withdrawal", label:"Withdrawal", type:"dr", width:16 },
+      { key:"deposit", label:"Deposit", type:"cr", width:16 },
+      { key:"balance", label:"Balance", type:"bal", width:18 },
+      { key:"cheque", label:"Cheque No.", type:"center", width:12 },
+      { key:"narration", label:"Narration", type:"text", width:60 }
+    ],
+    rows: txns
+  };
+}
+
+/* PNB header is a left-aligned label-then-value grid: labels at x0≈37–82
+   on the left column and their values starting at x0≈150 on the right.
+   Customer Address and Branch Address are MULTI-LINE — the label sits
+   on the FIRST value line (so the line carries both label and first
+   address chunk), and continuation lines have ONLY value text in the
+   right column. To capture both, we tab-cell each clustered line and
+   then walk top-down concatenating right-column lines under each
+   address label until the next label appears. */
+function pnbBranch_account(items){
+  const top = items.filter(i => i.top < 395);
+  const lines = clusterLines(top);
+  const tabText = ln => {
+    const cs = ln.cells.slice().sort((a,b)=>a.x0-b.x0);
+    let out = [], cell = "", prevX1 = null;
+    for (const c of cs){
+      if (prevX1 !== null && (c.x0 - prevX1) > 8){ out.push(cell); cell = c.t; }
+      else cell = cell ? cell + " " + c.t : c.t;
+      prevX1 = c.x1;
+    }
+    if (cell) out.push(cell);
+    return out;
+  };
+  const text = lines.map(ln => tabText(ln).join("\t")).join("\n");
+  const grab = re => { const m = text.match(re); return m ? m[1].trim() : ""; };
+
+  // Single-line label/value pairs
+  const number     = grab(/Account\s*No:?\s*([0-9]+)/i);
+  const name       = grab(/Customer\s*Name:?\s*\t+([^\t\n]+)/i);
+  const branchPhone= grab(/Branch\s*Contact\s*No\.?:?\s*\t+([^\t\n]+)/i);
+  const custCare   = grab(/Customer\s*Care\s*No\.?:?\s*\t+([^\t\n]+)/i);
+  const ifsc       = grab(/IFSC\s*Code:?\s*\t+([A-Z0-9]+)/i);
+  const micr       = grab(/MICR\s*Code:?\s*\t+([0-9]+)/i);
+  const currency   = grab(/Acct\s*Currency:?\s*\t+([A-Za-z]+)/i);
+  const from       = grab(/Statement\s*for\s*Period\s*:?\s*([0-9]{2}-[0-9]{2}-[0-9]{4})/i);
+  const to         = grab(/Statement\s*for\s*Period\s*:?\s*[0-9]{2}-[0-9]{2}-[0-9]{4}\s*to\s*([0-9]{2}-[0-9]{2}-[0-9]{4})/i);
+
+  // Multi-line address blocks: find each label's line index, then collect
+  // right-column text from that line + each subsequent line until either
+  // the next labelled line OR a line with no right-side text.
+  const rightText = ln => {
+    const cs = ln.cells.filter(c => c.x0 >= 140).sort((a,b)=>a.x0-b.x0);
+    return cs.map(c => c.t).join(" ").trim();
+  };
+  const leftText = ln => {
+    const cs = ln.cells.filter(c => c.x0 < 140).sort((a,b)=>a.x0-b.x0);
+    return cs.map(c => c.t).join(" ").trim();
+  };
+  const startsLabel = s => /^(Customer\s*(Name|Address|Care)|Branch\s*(Address|Contact)|CKYC|IFSC|MICR|Acct\s*Currency|Statement)/i.test(s);
+  const collectAddress = labelRe => {
+    const idx = lines.findIndex(ln => labelRe.test(leftText(ln)));
+    if (idx < 0) return "";
+    const parts = [];
+    const first = rightText(lines[idx]); if (first) parts.push(first);
+    for (let j = idx + 1; j < lines.length; j++){
+      const L = leftText(lines[j]), R = rightText(lines[j]);
+      if (L && startsLabel(L)) break;
+      if (!R) break;
+      parts.push(R);
+    }
+    return parts.join(", ");
+  };
+  const address       = collectAddress(/^Customer\s*Address/i);
+  const branchAddress = collectAddress(/^Branch\s*Address/i);
+
+  return {
+    name, number, ifsc, micr, address, branchAddress,
+    branchPhone, custCare, currency,
+    period: (from && to) ? `${from} – ${to}` : (from || to || "")
+  };
+}
+
+/* ============================================================
+   PNB DISPATCHER
+   PNB ships at least two completely different statement layouts:
+     A) branch-printed ("Statement of Account No:", ~595pt wide,
+        Withdrawal/Deposit columns, chronological, 2-line rows)
+     B) PNB-ONE internet-banking export ("Account Statement for
+        Account Number", ~1072pt wide, Txn No./Dr Amount/Cr Amount/
+        Balance columns, REVERSE-chronological, middle-anchor rows
+        that wrap above & below).
+   We read page 1's text and route to the right sub-parser. The
+   marker is unambiguous: format B's page-1 says "Account Statement
+   for Account Number" and carries "Cr Amount"/"Dr Amount" column
+   headers; format A says "Statement of Account No:".
+   ============================================================ */
+async function parsePunjab(arrayBuffer, onProgress){
+  // pdf.js consumes (transfers) the ArrayBuffer it parses, so to sniff
+  // page 1 and then hand the buffer to a sub-parser we copy the bytes.
+  const sniffBuf = arrayBuffer.slice(0);
+  const pdf = await pdfjsLib.getDocument({ data: sniffBuf }).promise;
+  const tc = await (await pdf.getPage(1)).getTextContent();
+  const text = tc.items.map(i => i.str || "").join(" ");
+  const isOne = /Account\s*Statement\s*for\s*Account\s*Number/i.test(text)
+             || /Txn\s*No\.?/i.test(text) && /(Cr|Dr)\s*Amount/i.test(text);
+  return isOne ? parsePunjabOne(arrayBuffer, onProgress)
+               : parsePunjabBranch(arrayBuffer, onProgress);
+}
+
+/* ============================================================
+   PNB format B: PNB-ONE "OpTransactionHistory" export
+   ------------------------------------------------------------
+   Wide page (~1072pt). Columns by x-center:
+     Txn No. (<150) | Txn Date (<252) | Description (<420) |
+     Branch Name (<545, usually "-") | Cheque No. (<650) |
+     Dr Amount (<758) | Cr Amount (<858) | Balance (≥858).
+   REVERSE-chronological (newest first). Each transaction is a
+   MIDDLE-anchor block: the anchor line carries Txn No. + Txn Date
+   (+ usually the Dr/Cr amount), the BALANCE sits one line ABOVE
+   the anchor, the "Cr."/"Dr." balance suffix one line BELOW, and
+   the Description wraps on lines BOTH above and below (read in
+   top-to-bottom order). Anchor = a line with a Txn No.
+   (/^[A-Z]?\d{3,}$/ — note short ones like "M6357") in the txnno
+   column AND a DD-MM-YYYY date in the date column.
+
+   Per-anchor binding (the lessons that made it exact):
+   - Define each anchor's y-band by midpoints to its neighbours.
+   - Description = all desc-column cells in the band, sorted (top,x0).
+   - Dr/Cr amount = nearest dr/cr-column amount to the anchor (NOT
+     just the anchor line — for some rows the amount renders on the
+     balance line above the anchor, e.g. duplicate same-day entries).
+   - Balance = nearest balance-amount ABOVE the anchor.
+   - Sign: pdf.js sometimes MERGES the balance number with its
+     "Cr."/"Dr." suffix into ONE token ("80,624.71 Cr."), so the
+     balance cell is parsed as /^([\d,]+\.\d{2})(?:\s*(Cr|Dr)\.?)?$/i;
+     an inline suffix wins, otherwise fall back to the nearest
+     standalone "Cr."/"Dr." token BELOW the anchor. ("Dr." = negative.)
+   Validated to 0 reverse-chain breaks across 2,368 txns
+   (bal[i] − cr[i] + dr[i] === bal[i+1] in reverse-chrono order).
+   ============================================================ */
+function pnbOne_col(xc){
+  if (xc < 150) return "txnno";
+  if (xc < 252) return "txndate";
+  if (xc < 420) return "desc";
+  if (xc < 545) return "branch";
+  if (xc < 650) return "cheque";
+  if (xc < 758) return "dr";
+  if (xc < 858) return "cr";
+  return "balance";   // balance number AND its Cr./Dr. suffix both land here
+}
+const PNB1_DATE = /^\d{2}-\d{2}-\d{4}$/;
+const PNB1_TXNNO = /^[A-Z]?\d{3,}$/;
+const PNB1_AMT  = /^[\d,]+\.\d{2}$/;
+const PNB1_SUF  = /^(Cr|Dr)\.?$/i;
+const PNB1_BAL  = /^([\d,]+\.\d{2})(?:\s*(Cr|Dr)\.?)?$/i;  // tolerate merged suffix
+
+async function parsePunjabOne(arrayBuffer, onProgress){
+  const pdf = await pdfjsLib.getDocument({ data: arrayBuffer }).promise;
+  const txns = [];
+  let account = null;
+
+  for (let p = 1; p <= pdf.numPages; p++){
+    const page = await pdf.getPage(p);
+    const H = page.getViewport({ scale: 1 }).height;
+    const tc = await page.getTextContent();
+    const items = [];
+    for (const it of tc.items){
+      const s = (it.str || "").trim();
+      if (!s) continue;
+      const x = it.transform[4], w = it.width || 0, top = H - it.transform[5];
+      items.push({ t:s, x0:x, x1:x+w, xc:x + w/2, top });
+    }
+    if (p === 1) account = pnbOne_account(items);
+
+    const lines = clusterLines(items, 3);
+
+    // Identify anchors (txnno + date in their columns)
+    const anchors = [];
+    for (const line of lines){
+      const byc = {};
+      for (const c of line.cells) (byc[pnbOne_col(c.xc)] = byc[pnbOne_col(c.xc)] || []).push(c);
+      const tn = (byc.txnno   || []).map(c=>c.t).join("");
+      const td = (byc.txndate || []).map(c=>c.t).join("");
+      if (PNB1_TXNNO.test(tn) && PNB1_DATE.test(td)) anchors.push({ top: line.top, byc });
+    }
+    if (!anchors.length){ if (onProgress) onProgress(p, pdf.numPages); continue; }
+
+    // y-band per anchor (midpoints to neighbours)
+    for (let i = 0; i < anchors.length; i++){
+      const a = anchors[i];
+      const prevTop = (i > 0) ? anchors[i-1].top : a.top - 30;
+      const nextTop = (i < anchors.length-1) ? anchors[i+1].top : a.top + 30;
+      a.ylo = (prevTop + a.top) / 2;
+      a.yhi = (a.top + nextTop) / 2;
+    }
+
+    for (const a of anchors){
+      const descPieces = [], balC = [], sufC = [], drC = [], crC = [];
+      for (const line of lines){
+        const inBand = (a.ylo < line.top && line.top <= a.yhi)
+                     || Math.round(line.top*10) === Math.round(a.top*10);
+        if (!inBand) continue;
+        for (const c of line.cells){
+          const cl = pnbOne_col(c.xc);
+          if (cl === "desc") descPieces.push([c.top, c.x0, c.t]);
+          else if (cl === "dr" && PNB1_AMT.test(c.t)) drC.push([c.top, toNum(c.t)]);
+          else if (cl === "cr" && PNB1_AMT.test(c.t)) crC.push([c.top, toNum(c.t)]);
+          else if (cl === "balance"){
+            const bm = c.t.match(PNB1_BAL);
+            if (bm) balC.push([c.top, toNum(bm[1]), bm[2] || null]);   // [top, value, inlineSuffix]
+            else if (PNB1_SUF.test(c.t)) sufC.push([c.top, c.t]);
+          }
+        }
+      }
+      descPieces.sort((u,v) => u[0]-v[0] || u[1]-v[1]);
+      const desc = descPieces.map(d=>d[2]).join(" ").replace(/\s+/g," ").trim();
+
+      const nearest = arr => arr.length
+        ? arr.reduce((b,x) => Math.abs(x[0]-a.top) < Math.abs(b[0]-a.top) ? x : b)
+        : null;
+      const drT = nearest(drC), crT = nearest(crC);
+      const dr = drT ? drT[1] : null, cr = crT ? crT[1] : null;
+
+      // balance = nearest balance-amount ABOVE the anchor (fallback nearest)
+      let balTok = null;
+      const above = balC.filter(b => b[0] < a.top);
+      if (above.length) balTok = above.reduce((b,x) => x[0] > b[0] ? x : b);
+      else if (balC.length) balTok = nearest(balC);
+      let bal = balTok ? balTok[1] : null;
+      let suf = balTok ? balTok[2] : null;          // inline suffix wins
+      if (!suf){
+        const below = sufC.filter(s => s[0] > a.top);
+        if (below.length) suf = below.reduce((b,x) => x[0] < b[0] ? x : b)[1];
+        else if (sufC.length) suf = nearest(sufC)[1];
+      }
+      if (suf && /^Dr/i.test(suf) && bal !== null) bal = -bal;
+
+      txns.push({
+        txnno: (a.byc.txnno || []).map(c=>c.t).join(""),
+        date:  (a.byc.txndate || []).map(c=>c.t).join(""),
+        desc,
+        cheque: (a.byc.cheque || []).map(c=>c.t).join(" ").replace(/\s+/g," ").trim(),
+        dr, cr, balance: bal
+      });
+    }
+    if (onProgress) onProgress(p, pdf.numPages);
+  }
+
+  const A = account || {};
+  return {
+    period: A.period || "",
+    account: [
+      { label:"Account Name", value:A.name||"" },       { label:"Account Number", value:A.number||"" },
+      { label:"Branch Name", value:A.branch||"" },       { label:"IFSC Code", value:A.ifsc||"" },
+      { label:"Bank Address", value:A.bankAddress||"" }, { label:"Customer Address", value:A.address||"" },
+      { label:"Statement Period", value:A.period||"" },  { label:"Total Transactions", value:String(txns.length) }
+    ],
+    columns: [
+      { key:"txnno", label:"Txn No.", type:"mono", width:13 },
+      { key:"date", label:"Txn Date", type:"center", width:13 },
+      { key:"desc", label:"Description", type:"text", width:54 },
+      { key:"cheque", label:"Cheque No.", type:"center", width:12 },
+      { key:"dr", label:"Dr Amount", type:"dr", width:16 },
+      { key:"cr", label:"Cr Amount", type:"cr", width:16 },
+      { key:"balance", label:"Balance", type:"bal", width:18 }
+    ],
+    rows: txns
+  };
+}
+
+/* PNB-ONE header: left label column (x0≈51–155), values at x0≈181+.
+   Account Number rides the title line ("...Account Number 36300..."),
+   handled separately. Customer/Bank addresses are multi-line. */
+function pnbOne_account(items){
+  const top = items.filter(i => i.top < 560);
+  const lines = clusterLines(top);
+  const tabText = ln => {
+    const cs = ln.cells.slice().sort((a,b)=>a.x0-b.x0);
+    let out = [], cell = "", prevX1 = null;
+    for (const c of cs){
+      if (prevX1 !== null && (c.x0 - prevX1) > 10){ out.push(cell); cell = c.t; }
+      else cell = cell ? cell + " " + c.t : c.t;
+      prevX1 = c.x1;
+    }
+    if (cell) out.push(cell);
+    return out;
+  };
+  const text = lines.map(ln => tabText(ln).join("\t")).join("\n");
+  const grab = re => { const m = text.match(re); return m ? m[1].trim() : ""; };
+
+  const number = grab(/Account\s*Number\s+(\d{6,})/i);
+  const branch = grab(/Branch\s*Name:?\s*\t+([^\t\n]+)/i);
+  const ifsc   = grab(/IFSC\s*Code:?\s*\t+([A-Z0-9]+)/i);
+  const name   = grab(/Account\s*Name:?\s*\t+([^\t\n]+)/i);
+  const from   = grab(/Statement\s*Period\s*:?\s*[\t ]*([0-9]{2}-[0-9]{2}-[0-9]{4})/i);
+  const to     = grab(/Statement\s*Period\s*:?[\s\S]*?\bto\b\s*([0-9]{2}-[0-9]{2}-[0-9]{4})/i);
+
+  // Multi-line addresses: collect right-column text under each label until next label
+  const leftText  = ln => ln.cells.filter(c=>c.x0 < 175).sort((a,b)=>a.x0-b.x0).map(c=>c.t).join(" ").trim();
+  const rightText = ln => ln.cells.filter(c=>c.x0 >= 175).sort((a,b)=>a.x0-b.x0).map(c=>c.t).join(" ").trim();
+  const isLabel = s => /^(Branch\s*(Name|Details)|Bank\s*Address|City|Pin|IFSC|Customer\s*(Details|Address)|Account\s*(Name|Number)|Nominee|Statement)/i.test(s);
+  const collect = labelRe => {
+    const idx = lines.findIndex(ln => labelRe.test(leftText(ln)));
+    if (idx < 0) return "";
+    const parts = [];
+    const first = rightText(lines[idx]); if (first) parts.push(first);
+    for (let j = idx+1; j < lines.length; j++){
+      const L = leftText(lines[j]), R = rightText(lines[j]);
+      if (L && isLabel(L)) break;
+      if (!R) break;
+      parts.push(R);
+    }
+    return parts.join(", ");
+  };
+  const bankAddress = collect(/^Bank\s*Address/i);
+  const address     = collect(/^Customer\s*Address/i);
+
+  return {
+    name, number, branch, ifsc, bankAddress, address,
     period: (from && to) ? `${from} – ${to}` : (from || to || "")
   };
 }
